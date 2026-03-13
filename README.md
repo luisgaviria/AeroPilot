@@ -2,10 +2,10 @@
   <h1 style="border-bottom: none;">🛸 AeroPilot</h1>
   <p><b>High-Fidelity AI Spatial Intelligence & Volumetric Mapping Engine</b></p>
 
-  <img src="https://img.shields.io/badge/Next.js-15-black?style=for-the-badge&logo=next.js" />
-  <img src="https://img.shields.io/badge/Three.js-3D_Geometry-blue?style=for-the-badge&logo=three.js" />
-  <img src="https://img.shields.io/badge/Gemini_2.0-AI_Vision-orange?style=for-the-badge&logo=google-gemini" />
-  <img src="https://img.shields.io/badge/Playwright-E2E_Testing-green?style=for-the-badge&logo=playwright" />
+  <img src="https://img.shields.io/badge/Next.js-15-black?style=for-the-badge&logo=next.js" alt="Next.js" />
+  <img src="https://img.shields.io/badge/Three.js-3D_Geometry-blue?style=for-the-badge&logo=three.js" alt="Three.js" />
+  <img src="https://img.shields.io/badge/Gemini_2.0-AI_Vision-orange?style=for-the-badge&logo=google-gemini" alt="Gemini" />
+  <img src="https://img.shields.io/badge/Playwright-E2E_Testing-green?style=for-the-badge&logo=playwright" alt="Playwright" />
 
   <br />
   <br />
