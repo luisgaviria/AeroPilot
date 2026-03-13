@@ -25,7 +25,7 @@
   <tr>
     <td width="50%" valign="top">
       <h3>🌍 Dynamic Enclosure Discovery</h3>
-      Zero hard-coding. AeroPilot performs <b>6-Axis Raycasting</b> on initialization to detect the "Ground Truth" of any 3D environment (Ceiling Height, Wall Boundaries, and Total Volume).
+       AeroPilot performs <b>6-Axis Raycasting</b> on initialization to detect the "Ground Truth" of any 3D environment (Ceiling Height, Wall Boundaries, and Total Volume).
     </td>
     <td width="50%" valign="top">
       <h3>📦 Adaptive Voxel Mapping</h3>
@@ -94,7 +94,7 @@ AeroPilot is built with a **Test-Driven Spatial Development** philosophy. Our E2
 
 - **Frontend:** Next.js 15 (App Router), React, Tailwind CSS
 - **3D Engine:** Three.js / React Three Fiber (R3F)
-- **AI Vision:** Gemini 2.0 Flash (Multimodal)
+- **AI Vision:** Gemini 2.5 Flash (Multimodal)
 - **Spatial Logic:** Custom Voxel BFS, Raycasting, Surface Normal Calculus
 - **Persistence:** Zustand (AeroStore) with LocalStorage checkpointing
 - **Optimization:** Asynchronous Batching (Parallel Promise Queue)
