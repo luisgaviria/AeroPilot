@@ -1,10 +1,14 @@
 import { Scene } from "@/components/canvas/Scene";
 import { StatusIndicator } from "@/components/ui/StatusIndicator";
 import { ChatInput } from "@/components/ui/ChatInput";
+import { TourOverlay } from "@/components/ui/TourOverlay";
 
 export default function Home() {
   return (
     <main className="relative h-screen w-screen overflow-hidden bg-black">
+      {/* Cinematic tour overlay — centred at bottom, above canvas UI */}
+      <TourOverlay />
+
       {/* Full-viewport 3D canvas */}
       <div className="absolute inset-0">
         <Scene />

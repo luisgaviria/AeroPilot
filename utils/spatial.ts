@@ -456,7 +456,7 @@ const FLOOR_SNAP_THRESHOLD = 0.15; // snap cluster base to Y=0 if within 15 cm
 const FLOOD_MAX_VOXELS = 5_000; // BFS safety cap
 const MAX_FURNITURE_MESH_RADIUS = 8.0; // raised: GLB may bake all geometry into 1-2 large meshes
 /** Objects where we measure the AIR GAP (opening) rather than surrounding structure. */
-const NEGATIVE_SPACE_RE = /door|opening|doorway|archway|passage|walkway/i;
+const NEGATIVE_SPACE_RE = /door|opening|doorway|archway|passage|walkway|window/i;
 /** Last-resort fallback radius when no solid voxel cluster is found. */
 const RADIUS_FALLBACK_M = 0.3;
 /** Fill-ratio (solid voxels / bbox voxels) below which adaptive BFS widens its gap. */
@@ -489,7 +489,22 @@ export function getObjectMeshBounds(
   centerPos: Vector3Tuple,
   searchRadius = 2.5,
   objectName = "",
-  opts?: { neckMinWidth?: number }
+  opts?: {
+    neckMinWidth?: number;
+    /**
+     * Override the voxel grid resolution in metres (default 0.1).
+     * Set to 0.05 for thin-cluster and ceiling-proximity re-passes.
+     * Guards against infinite recursion: the recursive call always passes 0.05,
+     * which is ≤ 0.05, so it never triggers another recursive call.
+     */
+    voxelSize?: number;
+    /**
+     * Room height in metres, used for:
+     *   (a) ceiling-proximity detection (centre > 85 % of height → high-res pass)
+     *   (b) ceiling-snap (top boundary within 10 cm of ceiling → extend to touch it)
+     */
+    roomHeight?: number;
+  }
 ): {
   width: number;
   height: number;
@@ -497,7 +512,19 @@ export function getObjectMeshBounds(
   center: Vector3Tuple;
   voxelCount: number;
   clipping_warning?: boolean;
+  /** True for doors/windows — dimensions describe the void, not a solid mass. */
+  isOpening?: boolean;
 } | null {
+  // ── Resolution: use caller-supplied voxel size or the default 0.1 m ──────────
+  // `VS` replaces every VOXEL_SIZE reference inside this function so a high-res
+  // re-pass at 0.05 m can be triggered without touching module-level constants.
+  const VS = opts?.voxelSize ?? VOXEL_SIZE;
+  // Scale the BFS horizontal-span cap proportionally so the same physical reach
+  // is preserved regardless of grid resolution.
+  // VS=0.10 → BFS_HORIZ_SPAN=22 voxels (2.2 m, unchanged)
+  // VS=0.05 → BFS_HORIZ_SPAN=44 voxels (2.2 m physical span)
+  const BFS_HORIZ_SPAN = Math.round(MAX_BFS_HORIZ_SPAN * (VOXEL_SIZE / VS));
+
   const origin = new Vector3(...centerPos);
   const sphere = new Sphere(origin, searchRadius);
 
@@ -573,9 +600,9 @@ export function getObjectMeshBounds(
         if (!ins[vi]) continue;
         const vt = verts[vi];
         const key = voxelKey(
-          Math.floor(vt.x / VOXEL_SIZE),
-          Math.floor(vt.y / VOXEL_SIZE),
-          Math.floor(vt.z / VOXEL_SIZE)
+          Math.floor(vt.x / VS),
+          Math.floor(vt.y / VS),
+          Math.floor(vt.z / VS)
         );
         solid.add(key);
         const ex = normalMap.get(key);
@@ -587,6 +614,93 @@ export function getObjectMeshBounds(
 
   // Normalise all accumulated normals to unit length
   for (const [, n] of normalMap) n.normalize();
+
+  // ── Step 1b: Structural voxel set for opening/gap sweeps ─────────────────────
+  // Unlike `solid` (upward-facing furniture surfaces only), `structural` captures
+  // ALL geometry — walls, frames, sills, ceilings — so horizontal gap sweeps can
+  // find structural hits even when the probe is floating in empty air.
+  // Built only for openings (zero cost for regular objects).
+  const structural = new Set<string>();
+  if (NEGATIVE_SPACE_RE.test(objectName)) {
+    const _sv = new Vector3();
+    scene.traverse((obj) => {
+      if (!(obj instanceof Mesh)) return;
+      if (ENV_EXCLUDE.test(obj.name)) return;
+      if (meshRadius(obj) < MIN_MESH_RADIUS) return;
+      // No upper radius cap — room-enclosure meshes (walls, ceiling) ARE structural
+      obj.updateWorldMatrix(true, false);
+      if (!sphere.intersectsBox(new Box3().setFromObject(obj))) return;
+      const pa = obj.geometry?.attributes?.position as BufferAttribute | undefined;
+      if (!pa) return;
+      for (let i = 0; i < pa.count; i++) {
+        _sv.fromBufferAttribute(pa, i).applyMatrix4(obj.matrixWorld);
+        if (!voxSphere.containsPoint(_sv)) continue;
+        structural.add(voxelKey(
+          Math.floor(_sv.x / VS),
+          Math.floor(_sv.y / VS),
+          Math.floor(_sv.z / VS),
+        ));
+      }
+    });
+    console.log(
+      `[getObjectMeshBounds] "${objectName}" structural voxels: ${structural.size} ` +
+      `(solid: ${solid.size})`
+    );
+  }
+
+  // ── Step 2a: Negative-Space Rule — measure the AIR GAP for openings ──────────
+  // Placed BEFORE the solid.size===0 guard because openings legitimately have
+  // zero upward-facing (furniture) voxels — we measure the void, not solid mass.
+  if (NEGATIVE_SPACE_RE.test(objectName)) {
+    const oSX = Math.floor(origin.x / VS);
+    const oSY = Math.floor(origin.y / VS);
+    const oSZ = Math.floor(origin.z / VS);
+
+    // Prefer structural (includes walls); fall back to solid when structural is empty.
+    const scanSet = structural.size > 0 ? structural : solid;
+    const MAX_SCAN = 80; // 80 voxels = 8 m
+
+    function scanToStructural(dix: number, diy: number, diz: number): number {
+      for (let s = 1; s <= MAX_SCAN; s++) {
+        if (scanSet.has(voxelKey(oSX + s * dix, oSY + s * diy, oSZ + s * diz)))
+          return s;
+      }
+      return MAX_SCAN;
+    }
+
+    const lft = scanToStructural(-1,  0,  0);
+    const rgt = scanToStructural(+1,  0,  0);
+    const fwd = scanToStructural( 0,  0, -1);
+    const bck = scanToStructural( 0,  0, +1);
+    const up  = scanToStructural( 0, +1,  0);
+    const dn  = scanToStructural( 0, -1,  0);
+
+    const gapX = (lft + rgt) * VS;
+    const gapZ = (fwd + bck) * VS;
+
+    // Opening width = LARGER horizontal gap (the span across the opening).
+    // Depth = SMALLER horizontal gap (wall thickness / frame depth).
+    const width = +Math.max(gapX, gapZ).toFixed(2);
+    const depth = +Math.min(gapX, gapZ).toFixed(2);
+
+    // Height = from sill/floor below the probe to the lintel above it.
+    const lintelY = (oSY + up) * VS;
+    const bottomY = Math.max(0, (oSY - dn) * VS);
+    const height  = +Math.max(0, lintelY - bottomY).toFixed(2);
+
+    console.log(
+      `[getObjectMeshBounds] "${objectName}" opening sweep: ` +
+      `±X=${lft}+${rgt} ±Z=${fwd}+${bck} ↑${up} ↓${dn} voxels ` +
+      `→ ${width}×${height}×${depth} m (W×H×D)`
+    );
+
+    return {
+      width, height, depth,
+      center: centerPos,
+      voxelCount: 0,
+      isOpening: true,
+    };
+  }
 
   // ── Radius fallback ──────────────────────────────────────────────────────────
   // Used when voxelization finds no solid cells (ray landed on a wall/large mesh
@@ -690,33 +804,10 @@ export function getObjectMeshBounds(
     return radiusFallback();
   }
 
-  const sx = Math.floor(origin.x / VOXEL_SIZE);
-  const sy = Math.floor(origin.y / VOXEL_SIZE);
-  const sz = Math.floor(origin.z / VOXEL_SIZE);
-
-  // ── Step 2a: Negative-Space Rule — measure the AIR GAP for openings ──────────
-  if (NEGATIVE_SPACE_RE.test(objectName)) {
-    function scanToSolid(dix: number, diy: number, diz: number): number {
-      for (let s = 1; s <= 40; s++) {
-        if (solid.has(voxelKey(sx + s * dix, sy + s * diy, sz + s * diz)))
-          return s;
-      }
-      return 40;
-    }
-    const lft = scanToSolid(-1, 0, 0);
-    const rgt = scanToSolid(+1, 0, 0);
-    const fwd = scanToSolid(0, 0, -1);
-    const bck = scanToSolid(0, 0, +1);
-    const top = scanToSolid(0, +1, 0);
-
-    const gapX = (lft + rgt) * VOXEL_SIZE;
-    const gapZ = (fwd + bck) * VOXEL_SIZE;
-    const width = +Math.min(gapX, gapZ).toFixed(2); // narrower gap = opening width
-    const depth = +Math.max(gapX, gapZ).toFixed(2);
-    const height = +((sy + top) * VOXEL_SIZE).toFixed(2); // Y=0 to lintel
-
-    return { width, height, depth, center: centerPos, voxelCount: 0 };
-  }
+  // Opening detections returned early above — only solid-mass BFS reaches here.
+  const sx = Math.floor(origin.x / VS);
+  const sy = Math.floor(origin.y / VS);
+  const sz = Math.floor(origin.z / VS);
 
   // ── Step 2b: Seed search ─────────────────────────────────────────────────────
   let seedX = sx,
@@ -725,7 +816,7 @@ export function getObjectMeshBounds(
 
   if (!solid.has(voxelKey(seedX, seedY, seedZ))) {
     let found = false;
-    const seedSearchR = Math.floor(VOX_CAPTURE_RADIUS / VOXEL_SIZE);
+    const seedSearchR = Math.floor(VOX_CAPTURE_RADIUS / VS);
     outerSearch: for (let r = 1; r <= seedSearchR; r++) {
       for (let dx = -r; dx <= r; dx++) {
         for (let dy = 0; dy <= r; dy++) {
@@ -804,14 +895,16 @@ export function getObjectMeshBounds(
             ny = cy + by * s,
             nz = cz + bz * s;
           // Hard horizontal span cap — checked against the already-added AABB.
+          // Uses BFS_HORIZ_SPAN (scaled from MAX_BFS_HORIZ_SPAN by VS) so the
+          // physical reach stays constant regardless of voxel resolution.
           if (
             bx !== 0 &&
-            Math.max(mxX, nx) - Math.min(mnX, nx) + 1 > MAX_BFS_HORIZ_SPAN
+            Math.max(mxX, nx) - Math.min(mnX, nx) + 1 > BFS_HORIZ_SPAN
           )
             break;
           if (
             bz !== 0 &&
-            Math.max(mxZ, nz) - Math.min(mnZ, nz) + 1 > MAX_BFS_HORIZ_SPAN
+            Math.max(mxZ, nz) - Math.min(mnZ, nz) + 1 > BFS_HORIZ_SPAN
           )
             break;
           const nk = voxelKey(nx, ny, nz);
@@ -1104,20 +1197,64 @@ export function getObjectMeshBounds(
   }
 
   // ── Step 5: Hard-Truth Floor snap ────────────────────────────────────────────
-  const rawBaseY = best.minIY * VOXEL_SIZE;
+  const rawBaseY = best.minIY * VS;
   const baseY = rawBaseY < FLOOR_SNAP_THRESHOLD ? 0 : rawBaseY;
 
   // ── Step 6: Bounding box + auto-centred position ─────────────────────────────
-  const width = +((best.maxIX - best.minIX + 1) * VOXEL_SIZE).toFixed(2);
-  const height = +((best.maxIY + 1) * VOXEL_SIZE - baseY).toFixed(2);
-  const depth = +((best.maxIZ - best.minIZ + 1) * VOXEL_SIZE).toFixed(2);
+  const width  = +((best.maxIX - best.minIX + 1) * VS).toFixed(2);
+  let   height = +((best.maxIY + 1) * VS - baseY).toFixed(2);
+  const depth  = +((best.maxIZ - best.minIZ + 1) * VS).toFixed(2);
 
   // Anchor the returned center at the BFS seed voxel (XZ).
-  // This keeps the center close to the original probe position, so re-probing
-  // at this center uses nearly the same capture sphere → same solid set → same BFS result.
-  const centerX = +((seedX + 0.5) * VOXEL_SIZE).toFixed(3);
+  const centerX = +((seedX + 0.5) * VS).toFixed(3);
   const centerY = +(baseY + height / 2).toFixed(3);
-  const centerZ = +((seedZ + 0.5) * VOXEL_SIZE).toFixed(3);
+  const centerZ = +((seedZ + 0.5) * VS).toFixed(3);
+
+  // ── Ceiling snap (req 4) ──────────────────────────────────────────────────────
+  // If the cluster's top boundary is within 10 cm of the detected ceiling plane,
+  // extend height to meet it exactly — eliminates the tape-measure gap on tall
+  // objects (wardrobes, curtains, wall panels) and ceiling-mounted fixtures.
+  if (opts?.roomHeight != null) {
+    const topY = baseY + height;
+    const gap  = opts.roomHeight - topY;
+    if (gap >= 0 && gap < 0.10) {
+      const snapped = +(opts.roomHeight - baseY).toFixed(2);
+      console.log(
+        `[getObjectMeshBounds] "${objectName}" ceiling snap: ` +
+        `${height.toFixed(3)} → ${snapped.toFixed(3)} m (gap was ${gap.toFixed(3)} m)`
+      );
+      height = snapped;
+    }
+  }
+
+  // ── Adaptive voxel resolution (req 1 + 2) ────────────────────────────────────
+  // Trigger a high-res (0.05 m) re-pass when:
+  //   (a) The cluster is geometrically "thin" — min(w, h, d) < 0.15 m.
+  //       Catches wall panels, shelf lips, ceiling fans, and any planar feature
+  //       that spans ≤ 1 voxel at 0.10 m resolution.
+  //   (b) The object centre is in the top 15 % of the room's Y-enclosure.
+  //       Ensures ceiling-mounted fixtures are measured accurately regardless
+  //       of their label (fans, pendant lights, smoke detectors, roof vents).
+  // Guard: only recurse when VS > 0.05 so the re-pass never triggers another.
+  if (VS > 0.05) {
+    const minDim     = Math.min(width, height, depth);
+    const nearCeiling = opts?.roomHeight != null && centerY > opts.roomHeight * 0.85;
+    if (minDim < 0.15 || nearCeiling) {
+      console.log(
+        `[getObjectMeshBounds] "${objectName}" → high-res pass (VS=0.05): ` +
+        `minDim=${minDim.toFixed(2)} m nearCeiling=${nearCeiling}`
+      );
+      const hires = getObjectMeshBounds(scene, centerPos, searchRadius, objectName, {
+        ...opts,
+        voxelSize: 0.05,
+      });
+      if (hires) return hires;
+      // High-res pass returned null (no voxels at finer grid) — keep coarse result.
+      console.warn(
+        `[getObjectMeshBounds] "${objectName}" high-res pass returned null — using 0.10 m result`
+      );
+    }
+  }
 
   return {
     width,

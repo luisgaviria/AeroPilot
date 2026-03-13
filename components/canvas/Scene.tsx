@@ -67,9 +67,12 @@ function SpatialLabel({ obj }: { obj: DetectedObject }) {
   );
 }
 
-/** Renders a persistent AR label for every detected object. */
+/** Renders a persistent AR label for every detected object (hidden during cinematic tour). */
 function SpatialLabels() {
   const detectedObjects = useAeroStore((s) => s.detectedObjects);
+  const isTouring       = useAeroStore((s) => s.isTouring);
+
+  if (isTouring) return null;
 
   return (
     <>

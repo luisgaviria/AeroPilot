@@ -77,12 +77,16 @@ export function ScanBridge() {
         /** Minimum expected footprint (m²) for large-label objects. */
         const LARGE_FOOTPRINT_MIN = 1.0;
 
+        // Room height — passed to getObjectMeshBounds for ceiling-proximity detection
+        // and ceiling snap.  Falls back to undefined if not yet measured.
+        const roomHeight = useAeroStore.getState().roomDimensions?.height;
+
         function measureObject(
           obj: VisionObject,
           center3D: Vector3Tuple,
         ): { dims: { width: number; height: number; depth: number }; center: Vector3Tuple; voxelCount: number; clipping_warning?: boolean } | null {
           const INITIAL_RADIUS = 2.5;
-          let result = getObjectMeshBounds(scene, center3D, INITIAL_RADIUS, obj.name);
+          let result = getObjectMeshBounds(scene, center3D, INITIAL_RADIUS, obj.name, { roomHeight });
           if (!result) return null;
 
           // ── Adaptive refinement: if a large-label object has a small footprint,
@@ -101,7 +105,7 @@ export function ScanBridge() {
               center3D,
               refinedRadius,
               obj.name,
-              { neckMinWidth: 1 },
+              { neckMinWidth: 1, roomHeight },
             );
             if (refined && refined.width * refined.depth > result.width * result.depth) {
               console.log(

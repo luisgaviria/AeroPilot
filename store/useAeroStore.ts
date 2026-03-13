@@ -1,8 +1,29 @@
 import { create } from "zustand";
 import { Vector3Tuple } from "three";
 import { locations } from "@/data/locations";
-import { DetectedObject, IncomingDetection } from "@/types/auto-discovery";
+import { DetectedObject, IncomingDetection, TourStop } from "@/types/auto-discovery";
 import type { RoomDimensions } from "@/utils/spatial";
+import { computeScaleFactor, scaleDims, type AnchorMatch } from "@/utils/semanticScale";
+
+const VERIFIED_SCALE_KEY = "vista_verified_scale";
+
+function loadVerifiedScale(): number | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(VERIFIED_SCALE_KEY);
+    if (!raw) return null;
+    const n = parseFloat(raw);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch { return null; }
+}
+
+function saveVerifiedScale(v: number | null): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (v == null) localStorage.removeItem(VERIFIED_SCALE_KEY);
+    else           localStorage.setItem(VERIFIED_SCALE_KEY, String(v));
+  } catch {}
+}
 
 export interface CameraConfig {
   position: Vector3Tuple;
@@ -44,6 +65,36 @@ interface AeroState {
   setDebugSnapshot: (url: string | null) => void;
   /** Persisted scan progress — restored after page reload mid-deep-scan. */
   scanCheckpoint: { progress: number; detectedObjects: DetectedObject[] } | null;
+
+  // ── Semantic Scale Calibration ────────────────────────────────────────────
+  /** Auto-computed scale factor derived from semantic anchors (1.0 = no correction). */
+  scaleFactor: number;
+  /**
+   * "Tape Measure" manual override.  When set, takes precedence over scaleFactor.
+   * Persisted to localStorage so it survives page reload.
+   */
+  verifiedScaleFactor: number | null;
+  /** Per-anchor match log from the most recent scale computation. */
+  anchorLog: AnchorMatch[];
+  /** Set (or clear) the manual verified scale factor. */
+  setVerifiedScaleFactor: (factor: number | null) => void;
+
+  // ── Cinematic Tour ────────────────────────────────────────────────────────
+  isTouring: boolean;
+  tourIndex: number;
+  /** Pre-computed geometric stop sequence (corner vantages + opening sweeps). */
+  tourStops: TourStop[];
+  /** Room-level spatial metrics displayed in the Agent Card. */
+  spatialClearance: {
+    totalArea: number;
+    walkableArea: number;
+    spatialCertainty: number;
+  } | null;
+  /** Push a narrative message directly without calling the API. */
+  setAiMessage: (msg: string) => void;
+  startTour: () => void;
+  stopTour: () => void;
+  tourAdvance: () => void;
 }
 
 // ─── Pure helpers (no store access needed) ────────────────────────────────────
@@ -128,6 +179,141 @@ function waitFor(predicate: () => boolean, timeout = 25_000): Promise<void> {
       }
     }, 100);
   });
+}
+
+// ─── Cinematic tour — geometric/structural ────────────────────────────────────
+
+const TOUR_EYE_HEIGHT  = 1.6;
+const TOUR_LOOK_HEIGHT = 1.2;
+/** Inset from each wall so the camera doesn't clip geometry. */
+const CORNER_INSET     = 0.6;
+/** Distance from the opening the camera stands during a sweep. */
+const SWEEP_CAM_DIST   = 1.8;
+
+/**
+ * Build the ordered sequence of geometric tour stops from room enclosure
+ * boundaries and any detected openings.
+ *
+ *  • 3 corner vantages, each aimed at the room's centre of mass.
+ *  • 1 pair of sweep stops (left-edge → right-edge) per detected opening.
+ *
+ * No object labels, no regex — purely spatial.
+ */
+export function buildTourStops(
+  room: RoomDimensions,
+  detectedObjects: DetectedObject[],
+): TourStop[] {
+  const hw = room.width  / 2;
+  const hl = room.length / 2;
+
+  // Centre of mass — average position3D of all detected objects, else origin.
+  const objs = detectedObjects;
+  const cx = objs.length
+    ? objs.reduce((s, o) => s + o.position3D[0], 0) / objs.length
+    : 0;
+  const cz = objs.length
+    ? objs.reduce((s, o) => s + o.position3D[2], 0) / objs.length
+    : 0;
+  const lookAtCenter: Vector3Tuple = [cx, TOUR_LOOK_HEIGHT, cz];
+
+  // 3 corner positions forming a triangle inside the room boundary.
+  const cornerPositions: Vector3Tuple[] = [
+    [-hw + CORNER_INSET, TOUR_EYE_HEIGHT, -hl + CORNER_INSET], // NW
+    [+hw - CORNER_INSET, TOUR_EYE_HEIGHT, -hl + CORNER_INSET], // NE
+    [0,                  TOUR_EYE_HEIGHT, +hl - CORNER_INSET], // S-centre
+  ];
+
+  const stops: TourStop[] = cornerPositions.map((position, i) => ({
+    kind:        "corner" as const,
+    position,
+    lookAt:      lookAtCenter,
+    cornerIndex: i,
+    durationMs:  6000,
+  }));
+
+  // Sweep stops — one left/right pair per opening.
+  const openings = detectedObjects.filter((o) => o.isOpening && o.dimensions);
+  for (const opening of openings) {
+    const [ox, oy, oz] = opening.position3D;
+    const halfW = (opening.dimensions!.width) / 2;
+
+    // Step back from the opening toward the room's centre of mass.
+    const dx  = cx - ox;
+    const dz  = cz - oz;
+    const len = Math.sqrt(dx * dx + dz * dz) || 1;
+
+    // Height adaptability: if the opening is elevated (window, roof vent),
+    // glide the camera up to meet it rather than staying at eye height.
+    const openingCenterY = opening.position3D[1];
+    const halfH          = (opening.dimensions!.height ?? 0) / 2;
+    const openingBottomY = Math.max(0, openingCenterY - halfH);
+    const sweepCamY      = openingBottomY > 1.4
+      ? Math.min(openingCenterY + 0.2, 3.2) // elevated — glide up to the feature
+      : TOUR_EYE_HEIGHT;                     // floor-level — standard eye height
+
+    const camPos: Vector3Tuple = [
+      ox + (dx / len) * SWEEP_CAM_DIST,
+      sweepCamY,
+      oz + (dz / len) * SWEEP_CAM_DIST,
+    ];
+
+    // Perpendicular axis in XZ for the horizontal sweep.
+    const perpX = -dz / len;
+    const perpZ =  dx / len;
+    const lookY = openingCenterY; // aim at the true centre of the gap
+
+    stops.push({
+      kind:         "sweep" as const,
+      position:     camPos,
+      lookAt:       [ox - perpX * halfW, lookY, oz - perpZ * halfW],
+      sweepPhase:   "left",
+      openingWidth: opening.dimensions!.width,
+      durationMs:   3000,
+    });
+    stops.push({
+      kind:         "sweep" as const,
+      position:     camPos,
+      lookAt:       [ox + perpX * halfW, lookY, oz + perpZ * halfW],
+      sweepPhase:   "right",
+      openingWidth: opening.dimensions!.width,
+      durationMs:   3000,
+    });
+  }
+
+  return stops;
+}
+
+/**
+ * Compute room-level spatial clearance metrics for the Agent Card.
+ *
+ * totalArea       — authoritative floor area from the 2D voxel map.
+ * walkableArea    — totalArea minus the footprint of every solid object.
+ * spatialCertainty — composite score: avg volumeAccuracy × scan coverage,
+ *                   representing how well the voxel engine captured the space.
+ */
+export function computeSpatialClearance(
+  room: RoomDimensions,
+  detectedObjects: DetectedObject[],
+): { totalArea: number; walkableArea: number; spatialCertainty: number } {
+  const totalArea = room.floorArea;
+
+  const footprintSum = detectedObjects
+    .filter((o) => !o.isOpening && o.dimensions)
+    .reduce((s, o) => s + o.dimensions!.width * o.dimensions!.depth, 0);
+
+  const walkableArea = Math.max(0, +(totalArea - footprintSum).toFixed(1));
+
+  const solidObjects = detectedObjects.filter((o) => !o.isOpening);
+  const withAccuracy = solidObjects.filter((o) => o.volumeAccuracy !== undefined);
+
+  let spatialCertainty = 0;
+  if (withAccuracy.length > 0) {
+    const avgAcc  = withAccuracy.reduce((s, o) => s + (o.volumeAccuracy ?? 0), 0) / withAccuracy.length;
+    const coverage = withAccuracy.length / Math.max(1, solidObjects.length);
+    spatialCertainty = Math.min(99, Math.round(avgAcc * coverage));
+  }
+
+  return { totalArea, walkableArea, spatialCertainty };
 }
 
 // ─── Zoom-intent pattern ──────────────────────────────────────────────────────
@@ -293,6 +479,72 @@ export const useAeroStore = create<AeroState>((set, get) => ({
   scanMode: "deep",
   setScanMode: (mode) => set({ scanMode: mode }),
 
+  // ── Semantic Scale Calibration ────────────────────────────────────────────
+  scaleFactor:         1.0,
+  verifiedScaleFactor: loadVerifiedScale(),
+  anchorLog:           [],
+
+  setVerifiedScaleFactor: (factor) => {
+    saveVerifiedScale(factor);
+    set({ verifiedScaleFactor: factor });
+    // Re-apply scale to all existing objects immediately.
+    const { detectedObjects, scaleFactor } = get();
+    const effective = factor ?? scaleFactor;
+    set({
+      detectedObjects: detectedObjects.map((o) =>
+        o.rawDimensions
+          ? { ...o, dimensions: scaleDims(o.rawDimensions, effective) }
+          : o,
+      ),
+    });
+  },
+
+  // ── Cinematic Tour ────────────────────────────────────────────────────────
+  isTouring:        false,
+  tourIndex:        0,
+  tourStops:        [],
+  spatialClearance: null,
+
+  setAiMessage: (msg) => set({ aiMessage: msg }),
+
+  startTour: () => {
+    const { detectedObjects, roomDimensions } = get();
+    if (!roomDimensions) return;
+    const tourStops = buildTourStops(roomDimensions, detectedObjects);
+    if (tourStops.length === 0) return;
+    const spatialClearance = computeSpatialClearance(roomDimensions, detectedObjects);
+    const first = tourStops[0];
+    set({
+      isTouring:        true,
+      tourIndex:        0,
+      tourStops,
+      spatialClearance,
+      aiMessage:        "",
+      cameraConfig:     freshConfig({ position: first.position, lookAt: first.lookAt }),
+      isMoving:         true,
+    });
+  },
+
+  stopTour: () => {
+    set({ isTouring: false, tourIndex: 0, tourStops: [], spatialClearance: null, aiMessage: "" });
+  },
+
+  tourAdvance: () => {
+    const { tourIndex, tourStops } = get();
+    const nextIdx = tourIndex + 1;
+    if (nextIdx >= tourStops.length) {
+      get().stopTour();
+      return;
+    }
+    const next = tourStops[nextIdx];
+    set({
+      tourIndex:    nextIdx,
+      aiMessage:    "",
+      cameraConfig: freshConfig({ position: next.position, lookAt: next.lookAt }),
+      isMoving:     true,
+    });
+  },
+
   triggerScan: () => set({ pendingScan: true, isScanning: true }),
 
   triggerDeepScan: () => {
@@ -349,8 +601,23 @@ export const useAeroStore = create<AeroState>((set, get) => ({
 
     const merged = [...existing];
 
-    /** Two objects within this distance (metres) are the same physical item. */
-    const MERGE_DIST = 1.5;
+    /**
+     * Confidence-weighted merge distance.
+     *
+     * High-confidence detections (> 95 %) are kept spatially distinct at 0.4 m —
+     * the model is sure they are separate objects (e.g. a TV and a doorway both
+     * detected in the same frame).
+     *
+     * Low-confidence detections get a 1.2 m radius so noisy, uncertain hits that
+     * land near an existing anchor are absorbed rather than creating ghost duplicates.
+     *
+     * This replaces the former flat 1.5 m constant, which was merging confidently-
+     * detected objects that happened to be close together (TV, door) while still
+     * allowing noise at long range.
+     */
+    function mergeThreshold(confA: number, confB: number): number {
+      return Math.max(confA, confB) > 0.95 ? 0.4 : 1.2;
+    }
     /** Minimum confidence to accept an incoming detection. */
     const CONFIDENCE_THRESHOLD = 0.8;
     /** Labels that imply a footprint ≥ 1.0 m². */
@@ -430,12 +697,14 @@ export const useAeroStore = create<AeroState>((set, get) => ({
         idx = merged.findIndex((o) => {
           const [ox, oy, oz] = o.position3D;
           const dx = ox - nx, dy = oy - ny, dz = oz - nz;
-          return Math.sqrt(dx * dx + dy * dy + dz * dz) < MERGE_DIST;
+          const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+          return dist < mergeThreshold(detConf, o.confidence ?? 0);
         });
         if (idx !== -1) {
+          const thresh = mergeThreshold(detConf, merged[idx].confidence ?? 0);
           console.log(
             `[AeroPilot] Proximity merge: "${det.name}" → "${merged[idx].name}" ` +
-            `(within ${MERGE_DIST} m)`
+            `(threshold=${thresh} m, confs: ${detConf.toFixed(2)}/${(merged[idx].confidence ?? 0).toFixed(2)})`
           );
         }
       }
@@ -465,8 +734,16 @@ export const useAeroStore = create<AeroState>((set, get) => ({
           ? (det.voxelCount  ?? prev.voxelCount)
           : (prev.voxelCount ?? det.voxelCount);
 
-        const fusedSizeConflict  = checkSizeConflict(winnerName, fusedDimensions);
-        const fusedVolumeAccuracy = computeVolumeAccuracy(fusedVoxelCount, fusedDimensions);
+        const fusedIsOpening     = det.isOpening ?? prev.isOpening ?? false;
+        const fusedSizeConflict  = fusedIsOpening ? false : checkSizeConflict(winnerName, fusedDimensions);
+        const fusedVolumeAccuracy = fusedIsOpening ? undefined : computeVolumeAccuracy(fusedVoxelCount, fusedDimensions);
+        // rawDimensions: preserve the higher-confidence scan's voxel measurement.
+        // det.dimensions is always the fresh voxel output (pre-scale); prev.rawDimensions
+        // is the last preserved raw reading.
+        const rawDimensions = useIncoming
+          ? (det.dimensions ?? prev.rawDimensions)
+          : (prev.rawDimensions ?? det.dimensions);
+
         const fused: DetectedObject = {
           ...prev,
           name: winnerName,
@@ -478,10 +755,12 @@ export const useAeroStore = create<AeroState>((set, get) => ({
           pixelCoords: det.pixelCoords,
           scanCount: n + 1,
           confidence: Math.max(prevConf, detConf),
-          dimensions: fusedDimensions,
+          rawDimensions,
+          dimensions: fusedDimensions, // will be replaced by scale pass below
           voxelCount: fusedVoxelCount,
           sizeConflict: fusedSizeConflict,
           volumeAccuracy: fusedVolumeAccuracy,
+          isOpening: fusedIsOpening || undefined,
         };
         if (fusedSizeConflict) {
           const fp = (fusedDimensions?.width ?? 0) * (fusedDimensions?.depth ?? 0);
@@ -497,20 +776,35 @@ export const useAeroStore = create<AeroState>((set, get) => ({
       } else {
         // ── New object — assign stable UID ───────────────────────────────────
         const uid = crypto.randomUUID();
-        const newSizeConflict   = checkSizeConflict(det.name, det.dimensions);
-        const newVolumeAccuracy = computeVolumeAccuracy(det.voxelCount, det.dimensions);
+        const newIsOpening      = det.isOpening ?? false;
+        const newSizeConflict   = newIsOpening ? false : checkSizeConflict(det.name, det.dimensions);
+        const newVolumeAccuracy = newIsOpening ? undefined : computeVolumeAccuracy(det.voxelCount, det.dimensions);
         if (newSizeConflict) {
           const fp = (det.dimensions?.width ?? 0) * (det.dimensions?.depth ?? 0);
           console.warn(
             `[AeroPilot] ⚠ SIZE CONFLICT "${det.name}" — footprint=${fp.toFixed(2)} m² < ${LARGE_FOOTPRINT_MIN} m² — needs re-scan`
           );
         }
-        merged.push({ ...det, uid, scanCount: 1, confidence: detConf, sizeConflict: newSizeConflict, volumeAccuracy: newVolumeAccuracy });
+        merged.push({ ...det, uid, scanCount: 1, confidence: detConf, sizeConflict: newSizeConflict, volumeAccuracy: newVolumeAccuracy, isOpening: newIsOpening || undefined, rawDimensions: det.dimensions });
         console.log(`[AeroPilot] New object "${det.name}" uid=${uid} conf=${detConf.toFixed(2)}`);
       }
     }
 
-    console.log(`[AeroPilot] Scan complete — ${incoming.length} incoming, ${merged.length} total.`);
-    set({ pendingScan: false, isScanning: false, detectedObjects: merged });
+    // ── Semantic scale pass ────────────────────────────────────────────────────
+    // Compute auto scale factor from high-confidence anchors, then apply the
+    // effective factor (verifiedScaleFactor takes precedence) to all objects.
+    const scaleResult = computeScaleFactor(merged);
+    const autoFactor  = scaleResult.factor;
+    const { verifiedScaleFactor } = get();
+    const effectiveFactor = verifiedScaleFactor ?? autoFactor;
+
+    const scaledMerged = merged.map((o) =>
+      o.rawDimensions
+        ? { ...o, dimensions: scaleDims(o.rawDimensions, effectiveFactor) }
+        : o,
+    );
+
+    console.log(`[AeroPilot] Scan complete — ${incoming.length} incoming, ${scaledMerged.length} total. Scale factor=${effectiveFactor.toFixed(4)} (auto=${autoFactor.toFixed(4)}, verified=${verifiedScaleFactor ?? "none"})`);
+    set({ pendingScan: false, isScanning: false, detectedObjects: scaledMerged, scaleFactor: autoFactor, anchorLog: scaleResult.matches });
   },
 }));
