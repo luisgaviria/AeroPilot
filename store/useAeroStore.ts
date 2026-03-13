@@ -25,14 +25,17 @@ interface AeroState {
   aiMessage: string;
   isThinking: boolean;
   sendMessage: (userMessage: string) => Promise<void>;
+  clearHistory: () => void;
 
   // ── Auto-Discovery ────────────────────────────────────────────────────────
   detectedObjects: DetectedObject[];
   pendingScan: boolean;
   isScanning: boolean;
   isDeepScanning: boolean;
-  deepScanProgress: number; // 1–8 during deep scan, 0 otherwise
-  deepScanTotal: number;    // always 8
+  deepScanProgress: number; // 1–N during deep scan, 0 otherwise
+  deepScanTotal: number;    // 4 (quick) or 8 (deep)
+  scanMode: "quick" | "deep";
+  setScanMode: (mode: "quick" | "deep") => void;
   triggerScan: () => void;
   triggerDeepScan: () => void;
   resolveScan: (incoming: IncomingDetection[]) => void;
@@ -186,6 +189,8 @@ export const useAeroStore = create<AeroState>((set, get) => ({
   aiMessage: "",
   isThinking: false,
 
+  clearHistory: () => set({ aiMessage: "" }),
+
   sendMessage: async (userMessage: string) => {
     // ── 1. Check if the user wants to zoom into a detected object ──────────
     const { detectedObjects } = get();
@@ -285,6 +290,9 @@ export const useAeroStore = create<AeroState>((set, get) => ({
   debugSnapshot: null,
   setDebugSnapshot: (url) => set({ debugSnapshot: url }),
 
+  scanMode: "deep",
+  setScanMode: (mode) => set({ scanMode: mode }),
+
   triggerScan: () => set({ pendingScan: true, isScanning: true }),
 
   triggerDeepScan: () => {
@@ -293,19 +301,23 @@ export const useAeroStore = create<AeroState>((set, get) => ({
 
     // Fire-and-forget async sequence; keeps the Zustand action signature `() => void`.
     (async () => {
-      set({ isDeepScanning: true, deepScanProgress: 0 });
+      const steps = get().scanMode === "quick"
+        ? DEEP_SCAN_STEPS.slice(0, 4)
+        : DEEP_SCAN_STEPS;
+      const total = steps.length;
+      set({ isDeepScanning: true, deepScanProgress: 0, deepScanTotal: total });
 
       try {
-        for (let i = 0; i < DEEP_SCAN_STEPS.length; i++) {
+        for (let i = 0; i < steps.length; i++) {
           const step = i + 1;
-          console.log(`[AeroPilot] Deep scan step ${step}/${DEEP_SCAN_TOTAL} — moving camera`);
+          console.log(`[AeroPilot] Deep scan step ${step}/${total} — moving camera`);
 
           // ── Move camera to this angle ─────────────────────────────────────
           // freshConfig ensures a new object reference → CameraRig re-renders
           // → settledRef.current resets to false → animation restarts.
           set({
             deepScanProgress: step,
-            cameraConfig: freshConfig(DEEP_SCAN_STEPS[i]),
+            cameraConfig: freshConfig(steps[i]),
             isMoving: true,
           });
 
@@ -326,7 +338,7 @@ export const useAeroStore = create<AeroState>((set, get) => ({
       } catch (err) {
         console.error("[AeroPilot] Deep scan failed:", err);
       } finally {
-        set({ isDeepScanning: false, deepScanProgress: 0 });
+        set({ isDeepScanning: false, deepScanProgress: 0, deepScanTotal: DEEP_SCAN_TOTAL });
         clearCheckpoint();
       }
     })();
@@ -341,6 +353,34 @@ export const useAeroStore = create<AeroState>((set, get) => ({
     const MERGE_DIST = 1.5;
     /** Minimum confidence to accept an incoming detection. */
     const CONFIDENCE_THRESHOLD = 0.8;
+    /** Labels that imply a footprint ≥ 1.0 m². */
+    const LARGE_FOOTPRINT_RE = /bed|sofa|couch|rug|carpet|sectional|loveseat|mattress/i;
+    /** Below this footprint (width × depth, m²) a large-label object is flagged as a conflict. */
+    const LARGE_FOOTPRINT_MIN = 1.0;
+
+    /** Compute sizeConflict: large label but still under-sized footprint. */
+    function checkSizeConflict(name: string, dimensions?: { width: number; height: number; depth: number }): boolean {
+      if (!LARGE_FOOTPRINT_RE.test(name)) return false;
+      if (!dimensions) return false;
+      const footprint = dimensions.width * dimensions.depth;
+      return footprint > 0 && footprint < LARGE_FOOTPRINT_MIN;
+    }
+
+    /**
+     * Volume fill-ratio score: (solid voxels / bounding-box voxels) × 100, capped at 99.
+     * VOXEL_SIZE = 0.1 m → voxels per axis = dim / 0.1
+     */
+    function computeVolumeAccuracy(
+      voxelCount: number | undefined,
+      dimensions: { width: number; height: number; depth: number } | undefined,
+    ): number | undefined {
+      if (!voxelCount || !dimensions) return undefined;
+      const wv = Math.max(1, Math.round(dimensions.width  / 0.1));
+      const hv = Math.max(1, Math.round(dimensions.height / 0.1));
+      const dv = Math.max(1, Math.round(dimensions.depth  / 0.1));
+      const bboxVox = wv * hv * dv;
+      return Math.min(99, Math.round((voxelCount / bboxVox) * 100));
+    }
 
     /**
      * Canonical name for semantic synonyms — detections in this map are merged
@@ -425,6 +465,8 @@ export const useAeroStore = create<AeroState>((set, get) => ({
           ? (det.voxelCount  ?? prev.voxelCount)
           : (prev.voxelCount ?? det.voxelCount);
 
+        const fusedSizeConflict  = checkSizeConflict(winnerName, fusedDimensions);
+        const fusedVolumeAccuracy = computeVolumeAccuracy(fusedVoxelCount, fusedDimensions);
         const fused: DetectedObject = {
           ...prev,
           name: winnerName,
@@ -438,7 +480,15 @@ export const useAeroStore = create<AeroState>((set, get) => ({
           confidence: Math.max(prevConf, detConf),
           dimensions: fusedDimensions,
           voxelCount: fusedVoxelCount,
+          sizeConflict: fusedSizeConflict,
+          volumeAccuracy: fusedVolumeAccuracy,
         };
+        if (fusedSizeConflict) {
+          const fp = (fusedDimensions?.width ?? 0) * (fusedDimensions?.depth ?? 0);
+          console.warn(
+            `[AeroPilot] ⚠ SIZE CONFLICT "${fused.name}" — footprint=${fp.toFixed(2)} m² < ${LARGE_FOOTPRINT_MIN} m² — needs re-scan`
+          );
+        }
         merged[idx] = fused;
         console.log(
           `[AeroPilot] Fused "${fused.name}" (scan #${n + 1}) → ` +
@@ -447,7 +497,15 @@ export const useAeroStore = create<AeroState>((set, get) => ({
       } else {
         // ── New object — assign stable UID ───────────────────────────────────
         const uid = crypto.randomUUID();
-        merged.push({ ...det, uid, scanCount: 1, confidence: detConf });
+        const newSizeConflict   = checkSizeConflict(det.name, det.dimensions);
+        const newVolumeAccuracy = computeVolumeAccuracy(det.voxelCount, det.dimensions);
+        if (newSizeConflict) {
+          const fp = (det.dimensions?.width ?? 0) * (det.dimensions?.depth ?? 0);
+          console.warn(
+            `[AeroPilot] ⚠ SIZE CONFLICT "${det.name}" — footprint=${fp.toFixed(2)} m² < ${LARGE_FOOTPRINT_MIN} m² — needs re-scan`
+          );
+        }
+        merged.push({ ...det, uid, scanCount: 1, confidence: detConf, sizeConflict: newSizeConflict, volumeAccuracy: newVolumeAccuracy });
         console.log(`[AeroPilot] New object "${det.name}" uid=${uid} conf=${detConf.toFixed(2)}`);
       }
     }

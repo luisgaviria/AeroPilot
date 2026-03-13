@@ -18,6 +18,7 @@
  */
 
 import { test, expect } from "@playwright/test";
+import mockData from "./mocks/spatial_mock.json";
 
 // ─── Shared types ────────────────────────────────────────────────────────────
 
@@ -79,6 +80,18 @@ async function gridSweep(
 
 test.describe("Spatial Sanity — Blind Geometric Suite", () => {
   test.beforeEach(async ({ page }) => {
+    // Intercept Vision API calls — spatial tests use measureAt() directly and
+    // must never trigger real API traffic.
+    await page.route("**/api/chat", async (route) => {
+      const body = route.request().postDataJSON() as { mode?: string } | null;
+      const payload = body?.mode === "discover" ? mockData.discover : mockData.chat;
+      await route.fulfill({
+        status:      200,
+        contentType: "application/json",
+        body:        JSON.stringify(payload),
+      });
+    });
+
     await page.goto("/");
     await waitForScene(page);
   });

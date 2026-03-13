@@ -37,6 +37,19 @@ export interface DetectedObject {
    * 0 = radius-fallback or negative-space path was used.
    */
   voxelCount?: number;
+  /**
+   * True when the label implies a large footprint (bed / sofa / rug) but the
+   * measured footprint (width × depth) is still < 1.0 m² after the adaptive
+   * refinement pass.  Surfaced as ⚠️ in the UI so the user knows to re-scan.
+   */
+  sizeConflict?: boolean;
+  /**
+   * Volume fill-ratio score (0–99).
+   * Formula: (solid voxel count / bounding-box voxel count) × 100, capped at 99.
+   * High values (> 85) indicate dense, well-measured geometry.
+   * Low values (< 60) indicate a sparse or partially-visible cluster.
+   */
+  volumeAccuracy?: number;
 }
 
 /**

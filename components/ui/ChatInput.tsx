@@ -105,12 +105,23 @@ export function ChatInput() {
               key={obj.name}
               onClick={() => sendMessage(`zoom in on the ${obj.name}`)}
               disabled={isBusy}
-              title={`3D: (${obj.position3D.map((v) => v.toFixed(1)).join(", ")})`}
-              className="flex flex-col items-center rounded-full border border-violet-400/50 bg-violet-500/20 px-2.5 py-1 text-xs font-medium text-violet-200 shadow-md shadow-violet-900/40 transition-colors hover:bg-violet-500/40 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+              title={
+                obj.sizeConflict
+                  ? `⚠ Size conflict — footprint < 1 m² for "${obj.name}". Re-scan for better accuracy.\n3D: (${obj.position3D.map((v) => v.toFixed(1)).join(", ")})`
+                  : `3D: (${obj.position3D.map((v) => v.toFixed(1)).join(", ")})`
+              }
+              className={`flex flex-col items-center rounded-full border px-2.5 py-1 text-xs font-medium shadow-md transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                obj.sizeConflict
+                  ? "border-amber-400/50 bg-amber-500/20 text-amber-200 shadow-amber-900/40 hover:bg-amber-500/40 hover:text-white"
+                  : "border-violet-400/50 bg-violet-500/20 text-violet-200 shadow-violet-900/40 hover:bg-violet-500/40 hover:text-white"
+              }`}
             >
-              <span>{obj.name}</span>
+              <span className="flex items-center gap-1">
+                {obj.sizeConflict && <span aria-label="size conflict">⚠️</span>}
+                {obj.name}
+              </span>
               {obj.confidence !== undefined && (
-                <span className="text-[9px] font-normal leading-none text-violet-400/70">
+                <span className={`text-[9px] font-normal leading-none ${obj.sizeConflict ? "text-amber-400/70" : "text-violet-400/70"}`}>
                   {Math.round(obj.confidence * 100)}%
                 </span>
               )}

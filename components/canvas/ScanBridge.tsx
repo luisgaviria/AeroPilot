@@ -72,12 +72,48 @@ export function ScanBridge() {
           return j;
         }
 
+        /** Labels that imply a footprint ≥ 1.0 m² — trigger adaptive refinement if undersized. */
+        const LARGE_FOOTPRINT_RE = /bed|sofa|couch|rug|carpet|sectional|loveseat|mattress/i;
+        /** Minimum expected footprint (m²) for large-label objects. */
+        const LARGE_FOOTPRINT_MIN = 1.0;
+
         function measureObject(
           obj: VisionObject,
           center3D: Vector3Tuple,
         ): { dims: { width: number; height: number; depth: number }; center: Vector3Tuple; voxelCount: number; clipping_warning?: boolean } | null {
-          const result = getObjectMeshBounds(scene, center3D, 2.5, obj.name);
+          const INITIAL_RADIUS = 2.5;
+          let result = getObjectMeshBounds(scene, center3D, INITIAL_RADIUS, obj.name);
           if (!result) return null;
+
+          // ── Adaptive refinement: if a large-label object has a small footprint,
+          //    search harder with a wider radius and a looser neck-detection threshold.
+          if (
+            LARGE_FOOTPRINT_RE.test(obj.name) &&
+            result.width * result.depth < LARGE_FOOTPRINT_MIN
+          ) {
+            const refinedRadius = INITIAL_RADIUS * 2;
+            console.log(
+              `[ScanBridge] "${obj.name}" footprint=${(result.width * result.depth).toFixed(2)} m² < ${LARGE_FOOTPRINT_MIN} — ` +
+              `retrying with radius=${refinedRadius} neckMinWidth=1`
+            );
+            const refined = getObjectMeshBounds(
+              scene,
+              center3D,
+              refinedRadius,
+              obj.name,
+              { neckMinWidth: 1 },
+            );
+            if (refined && refined.width * refined.depth > result.width * result.depth) {
+              console.log(
+                `[ScanBridge] "${obj.name}" refinement improved footprint ` +
+                `${(result.width * result.depth).toFixed(2)} → ${(refined.width * refined.depth).toFixed(2)} m²`
+              );
+              result = refined;
+            } else {
+              console.log(`[ScanBridge] "${obj.name}" refinement did not improve footprint — keeping original`);
+            }
+          }
+
           const { width, height, depth, center, voxelCount, clipping_warning } = result;
           if (clipping_warning) {
             console.warn(
@@ -93,7 +129,21 @@ export function ScanBridge() {
           return { dims: { width, height, depth }, center, voxelCount, clipping_warning };
         }
 
-        /** Calls Vision API with a pre-captured snapshot, then raycasts results. */
+        /** Pause until the tab is visible; polls every 1 s while hidden. */
+        async function waitForVisible(): Promise<void> {
+          while (
+            typeof document !== "undefined" &&
+            document.visibilityState !== "visible"
+          ) {
+            console.log("[ScanBridge] Tab not visible — pausing batch for 1 s");
+            await new Promise<void>((r) => setTimeout(r, 1_000));
+          }
+        }
+
+        /**
+         * Calls Vision API with a pre-captured snapshot, then raycasts results.
+         * Retries once (after 1 s) on 500 / 503 / 504 errors.
+         */
         async function processApiAndRaycast(
           snap: ReturnType<typeof captureSnapshotFromCamera>,
           cam: Camera,
@@ -105,21 +155,37 @@ export function ScanBridge() {
               ? "⚠ MISMATCH" : "✓")
           );
 
-          const res = await fetch("/api/chat", {
+          const RETRYABLE = new Set([500, 503, 504]);
+          const body = JSON.stringify({
+            mode: "discover",
+            image: snap.base64,
+            mimeType: snap.mimeType,
+            canvasWidth:  snap.width,
+            canvasHeight: snap.height,
+          });
+          const fetchOpts: RequestInit = {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              mode: "discover",
-              image: snap.base64,
-              mimeType: snap.mimeType,
-              canvasWidth:  snap.width,
-              canvasHeight: snap.height,
-            }),
-          });
+            body,
+          };
+
+          let res = await fetch("/api/chat", fetchOpts);
+
+          // ── 1-time retry on transient server errors ──────────────────────
+          if (!res.ok && RETRYABLE.has(res.status)) {
+            const errText = await res.text().catch(() => "(unreadable)");
+            console.warn(
+              `[ScanBridge][${label}] HTTP ${res.status} — retrying in 1 000 ms. Body: ${errText}`
+            );
+            await new Promise<void>((r) => setTimeout(r, 1_000));
+            res = await fetch("/api/chat", fetchOpts);
+          }
 
           if (!res.ok) {
-            const err = await res.json().catch(() => ({}));
-            console.error(`[ScanBridge][${label}] Vision API error:`, err);
+            const errText = await res.text().catch(() => "(unreadable)");
+            console.error(
+              `[ScanBridge][${label}] Vision API error HTTP ${res.status}: ${errText}`
+            );
             return [];
           }
 
@@ -203,29 +269,69 @@ export function ScanBridge() {
             return;
           }
 
-          // ── Final step: fire all API calls with 200ms stagger ─────────────
+          // ── Final step: fire in two batches of 4, 500 ms intra-batch stagger ──
           const batch = [...batchRef.current];
           batchRef.current = [];
+
+          const BATCH_SIZE   = 4;
+          const INTRA_STAGGER = 500; // ms between calls within a batch
+          const batch1 = batch.slice(0, BATCH_SIZE);
+          const batch2 = batch.slice(BATCH_SIZE);
+
           console.log(
-            `[ScanBridge] Firing ${batch.length} deep-scan API calls in parallel (200 ms stagger)`
+            `[ScanBridge] Firing deep-scan in 2 batches ` +
+            `(${batch1.length} + ${batch2.length}) with ${INTRA_STAGGER} ms intra-stagger`
           );
 
-          const batchPromises = batch.map(
-            (entry, i) =>
+          // Pause if the tab is hidden before we start firing.
+          await waitForVisible();
+
+          const allPromises: Promise<IncomingDetection[]>[] = [];
+
+          // ── Batch 1 ───────────────────────────────────────────────────────
+          for (let i = 0; i < batch1.length; i++) {
+            const entry = batch1[i];
+            const idx   = i;
+            allPromises.push(
               new Promise<IncomingDetection[]>((resolve) => {
                 setTimeout(async () => {
+                  await waitForVisible();
                   try {
-                    const result = await processApiAndRaycast(entry.snap, entry.cam, `deep-${i + 1}`);
-                    resolve(result);
+                    resolve(await processApiAndRaycast(entry.snap, entry.cam, `deep-${idx + 1}`));
                   } catch (err) {
-                    console.error(`[ScanBridge] deep-${i + 1} failed:`, err);
+                    console.error(`[ScanBridge] deep-${idx + 1} failed:`, err);
                     resolve([]);
                   }
-                }, i * 200);
+                }, idx * INTRA_STAGGER);
               }),
+            );
+          }
+
+          // Wait until every batch-1 call has been INITIATED before starting batch 2.
+          await new Promise<void>((r) =>
+            setTimeout(r, (batch1.length - 1) * INTRA_STAGGER),
           );
 
-          const settled = await Promise.allSettled(batchPromises);
+          // ── Batch 2 ───────────────────────────────────────────────────────
+          for (let i = 0; i < batch2.length; i++) {
+            const entry    = batch2[i];
+            const globalIdx = BATCH_SIZE + i;
+            allPromises.push(
+              new Promise<IncomingDetection[]>((resolve) => {
+                setTimeout(async () => {
+                  await waitForVisible();
+                  try {
+                    resolve(await processApiAndRaycast(entry.snap, entry.cam, `deep-${globalIdx + 1}`));
+                  } catch (err) {
+                    console.error(`[ScanBridge] deep-${globalIdx + 1} failed:`, err);
+                    resolve([]);
+                  }
+                }, i * INTRA_STAGGER);
+              }),
+            );
+          }
+
+          const settled = await Promise.allSettled(allPromises);
           const allDetections = settled
             .filter((r): r is PromiseFulfilledResult<IncomingDetection[]> => r.status === "fulfilled")
             .flatMap((r) => r.value);

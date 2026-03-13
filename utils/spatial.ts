@@ -43,9 +43,15 @@ export function captureSnapshot(canvas: HTMLCanvasElement): {
     canvas.clientHeight ||
     Math.round(canvas.height / (window?.devicePixelRatio ?? 1));
 
+  // Cap at 720p to reduce API payload size while preserving aspect ratio.
+  const MAX_H = 720;
+  const scale = cssH > MAX_H ? MAX_H / cssH : 1;
+  const outW = Math.round(cssW * scale);
+  const outH = Math.round(cssH * scale);
+
   const tmp = document.createElement("canvas");
-  tmp.width = cssW;
-  tmp.height = cssH;
+  tmp.width = outW;
+  tmp.height = outH;
   const ctx = tmp.getContext("2d");
   if (!ctx)
     throw new Error(
@@ -55,12 +61,12 @@ export function captureSnapshot(canvas: HTMLCanvasElement): {
   // transparent/black pixels (outside the room mesh) become a uniform gray
   // rather than pure black — reducing 'dead token' confusion for the vision model.
   ctx.fillStyle = "#808080";
-  ctx.fillRect(0, 0, cssW, cssH);
-  ctx.drawImage(canvas, 0, 0, cssW, cssH);
+  ctx.fillRect(0, 0, outW, outH);
+  ctx.drawImage(canvas, 0, 0, outW, outH);
 
-  const dataUrl = tmp.toDataURL("image/jpeg", 0.85);
+  const dataUrl = tmp.toDataURL("image/jpeg", 0.7);
   const base64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
-  return { base64, mimeType: "image/jpeg", width: cssW, height: cssH };
+  return { base64, mimeType: "image/jpeg", width: outW, height: outH };
 }
 
 /**
@@ -482,7 +488,8 @@ export function getObjectMeshBounds(
   scene: ThreeScene,
   centerPos: Vector3Tuple,
   searchRadius = 2.5,
-  objectName = ""
+  objectName = "",
+  opts?: { neckMinWidth?: number }
 ): {
   width: number;
   height: number;
@@ -844,7 +851,7 @@ export function getObjectMeshBounds(
   // ── Neck detection — severs thin bridges (< NECK_MIN_WIDTH horizontal neighbors) ──
   // After BFS finds a cluster, removes voxels that form narrow seams (1-2 wide)
   // and keeps only the connected component containing the BFS seed.
-  function applyNeckDetection(result: BFSResult): BFSResult {
+  function applyNeckDetection(result: BFSResult, neckMinWidth = NECK_MIN_WIDTH): BFSResult {
     const { visited } = result;
 
     const thin = new Set<string>();
@@ -859,7 +866,7 @@ export function getObjectMeshBounds(
       ] as [number, number][]) {
         if (visited.has(voxelKey(ix + dx, iy, iz + dz))) hCount++;
       }
-      if (hCount < NECK_MIN_WIDTH) thin.add(key);
+      if (hCount < neckMinWidth) thin.add(key);
     }
 
     if (thin.size === 0) return result; // no thin voxels — nothing to prune
@@ -1019,7 +1026,7 @@ export function getObjectMeshBounds(
   }
 
   // ── Step 3b: Neck detection — sever thin bridges between disconnected masses ──
-  best = applyNeckDetection(best);
+  best = applyNeckDetection(best, opts?.neckMinWidth ?? NECK_MIN_WIDTH);
 
   // ── Step 4: Structural plate trimming ────────────────────────────────────────
   // Compute per-Y-layer XZ footprint (cells).  Layers spreading more than
@@ -1468,7 +1475,13 @@ export function captureSnapshotFromCamera(
   cssWidth: number,
   cssHeight: number
 ): { base64: string; mimeType: string; width: number; height: number } {
-  const target = new WebGLRenderTarget(cssWidth, cssHeight);
+  // Cap at 720p — preserves aspect ratio, reduces API payload size.
+  const MAX_H = 720;
+  const scale = cssHeight > MAX_H ? MAX_H / cssHeight : 1;
+  const outW = Math.round(cssWidth * scale);
+  const outH = Math.round(cssHeight * scale);
+
+  const target = new WebGLRenderTarget(outW, outH);
 
   const prevTarget = renderer.getRenderTarget();
   renderer.setRenderTarget(target);
@@ -1476,16 +1489,16 @@ export function captureSnapshotFromCamera(
   renderer.setRenderTarget(prevTarget);
 
   // Read raw RGBA pixels — WebGL row 0 is the BOTTOM of the image.
-  const raw = new Uint8Array(cssWidth * cssHeight * 4);
-  renderer.readRenderTargetPixels(target, 0, 0, cssWidth, cssHeight, raw);
+  const raw = new Uint8Array(outW * outH * 4);
+  renderer.readRenderTargetPixels(target, 0, 0, outW, outH, raw);
   target.dispose();
 
   // Flip rows: WebGL bottom-to-top → Canvas 2D top-to-bottom.
-  const stride = cssWidth * 4;
-  const flipped = new Uint8ClampedArray(cssWidth * cssHeight * 4);
-  for (let row = 0; row < cssHeight; row++) {
+  const stride = outW * 4;
+  const flipped = new Uint8ClampedArray(outW * outH * 4);
+  for (let row = 0; row < outH; row++) {
     flipped.set(
-      raw.subarray((cssHeight - 1 - row) * stride, (cssHeight - row) * stride),
+      raw.subarray((outH - 1 - row) * stride, (outH - row) * stride),
       row * stride
     );
   }
@@ -1502,18 +1515,18 @@ export function captureSnapshotFromCamera(
   }
 
   const tmp = document.createElement("canvas");
-  tmp.width = cssWidth;
-  tmp.height = cssHeight;
+  tmp.width = outW;
+  tmp.height = outH;
   const ctx = tmp.getContext("2d");
   if (!ctx)
     throw new Error("[captureSnapshotFromCamera] cannot get 2D context");
-  ctx.putImageData(new ImageData(flipped, cssWidth, cssHeight), 0, 0);
+  ctx.putImageData(new ImageData(flipped, outW, outH), 0, 0);
 
-  const dataUrl = tmp.toDataURL("image/jpeg", 0.85);
+  const dataUrl = tmp.toDataURL("image/jpeg", 0.7);
   return {
     base64: dataUrl.slice(dataUrl.indexOf(",") + 1),
     mimeType: "image/jpeg",
-    width: cssWidth,
-    height: cssHeight,
+    width: outW,
+    height: outH,
   };
 }

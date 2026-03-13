@@ -1,0 +1,40 @@
+{
+  "discover": {
+    "objects": [
+      {
+        "name": "bed",
+        "x": 640,
+        "y": 450,
+        "confidence": 0.95,
+        "xLeft": 230,
+        "xRight": 1050,
+        "yTop": 370,
+        "yBottom": 600
+      },
+      {
+        "name": "sofa",
+        "x": 310,
+        "y": 420,
+        "confidence": 0.91,
+        "xLeft": 110,
+        "xRight": 510,
+        "yTop": 360,
+        "yBottom": 530
+      },
+      {
+        "name": "coffee table",
+        "x": 640,
+        "y": 550,
+        "confidence": 0.88,
+        "xLeft": 480,
+        "xRight": 800,
+        "yTop": 510,
+        "yBottom": 620
+      }
+    ]
+  },
+  "chat": {
+    "locationId": "current",
+    "message": "Mock response — API calls are intercepted during tests."
+  }
+}

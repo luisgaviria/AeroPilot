@@ -272,51 +272,27 @@ async function handleDiscover(body: {
     },
   });
 
-  // Be extremely explicit about the coordinate system.
-  // "Pixel coordinates" is ambiguous to vision models — spell out the exact
-  // origin, axes, and integer range so there is no room for normalised (0–1)
-  // or percentage (0–100) misinterpretation.
-  const floorThreshold  = Math.round(canvasHeight * 0.60); // y > this → near floor
-  const ceilingThreshold = Math.round(canvasHeight * 0.35); // y < this → near top of frame
+  const floorThreshold   = Math.round(canvasHeight * 0.60);
+  const ceilingThreshold = Math.round(canvasHeight * 0.35);
 
   const prompt = [
-    `You are an object-detection system for a 3D real-estate property scan.`,
+    `Object-detection for a 3D property scan. Image: ${canvasWidth}×${canvasHeight}px.`,
     ``,
-    `IMAGE DIMENSIONS: exactly ${canvasWidth} pixels wide × ${canvasHeight} pixels tall.`,
+    `TASK: ID every visible furniture/fixture. Short lowercase names ("sofa", "coffee table", "tv").`,
+    `Only include objects with confidence ≥ 0.8.`,
     ``,
-    `TASK: identify every clearly visible piece of furniture or fixture`,
-    `(sofa, armchair, dining table, coffee table, TV, TV stand, lamp, bookshelf,`,
-    `plant, kitchen counter, island, bed, wardrobe, desk, etc.).`,
+    `COORDINATES (integers only, no normalised/percentage values):`,
+    `  x: pixels from LEFT (0–${canvasWidth})  y: pixels from TOP (0–${canvasHeight})`,
+    `  Place x,y at the object's visible center.`,
+    `  xLeft/xRight = outermost visible X edges; yTop/yBottom = outermost visible Y edges. Use 0 if unknown.`,
     ``,
-    `COORDINATE RULES — follow precisely:`,
-    `  • x = horizontal pixel from the LEFT edge  (0 = left,  ${canvasWidth} = right)`,
-    `  • y = vertical   pixel from the TOP  edge  (0 = top,   ${canvasHeight} = bottom)`,
-    `  • Both values must be INTEGERS within those ranges.`,
-    `  • Do NOT use normalised (0–1) or percentage (0–100) values.`,
-    `  • Place the coordinate at the visible CENTER of the object.`,
+    `CLASSIFICATION HINTS:`,
+    `  y > ${floorThreshold} → floor-level (sofa, chair, table, cabinet, door)`,
+    `  y < ${ceilingThreshold} → top-of-frame (window, wall lamp, ceiling light, high shelf)`,
+    `  Wall opening: door if y > ${floorThreshold}, window if y < ${ceilingThreshold}.`,
+    `  Prefer specific names: "dining table" over "table" when chairs are present.`,
     ``,
-    `SEMANTIC CLUES — use pixel Y to disambiguate similar objects:`,
-    `  • Objects with center y > ${floorThreshold} are near the FLOOR: label as sofa, chair, table, cabinet, door, etc.`,
-    `  • Objects with center y < ${ceilingThreshold} are near the TOP of the frame: label as window, wall lamp, ceiling light, high shelf, etc.`,
-    `  • A rectangular opening in a WALL is a 'door' if its center y > ${floorThreshold}, or a 'window' if its center y < ${ceilingThreshold}.`,
-    `  • Prefer specific names: 'sofa' not 'furniture', 'dining table' not 'table' if chairs surround it.`,
-    ``,
-    `EDGE COORDINATES (xLeft, xRight, yTop, yBottom):`,
-    `  • For every object, also report the pixel X of its LEFT edge (xLeft) and RIGHT edge (xRight),`,
-    `    and the pixel Y of its TOP edge (yTop) and BOTTOM edge (yBottom).`,
-    `  • These must be the outermost VISIBLE pixels of the object — not the center.`,
-    `  • Example: a sofa spanning from pixel 120 to pixel 480 → xLeft=120, xRight=480.`,
-    `  • If an edge is cut off by the image border, use the border pixel value.`,
-    `  • If you genuinely cannot determine an edge, set it to 0.`,
-    `  • This is especially important for doors, windows, sofas, and tables where width matters.`,
-    ``,
-    `CONFIDENCE RULES:`,
-    `  • Set confidence = 1.0 when you are certain of both the object type and its position.`,
-    `  • Set confidence = 0.8–0.95 when the object is partially occluded or the type is ambiguous.`,
-    `  • Set confidence < 0.8 when you are guessing — omit the object entirely instead.`,
-    ``,
-    `Use short lowercase English names (e.g. "sofa", "coffee table", "tv").`,
-    `Only include objects you can clearly identify (confidence ≥ 0.8).`,
+    `CONFIDENCE: 1.0 = certain; 0.8–0.95 = partial occlusion/ambiguity; < 0.8 = omit.`,
   ].join("\n");
 
   const result = await model.generateContent({
