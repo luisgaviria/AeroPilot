@@ -216,6 +216,29 @@ export function computeScaleFactor(
     ).join(", "),
   );
 
+  // ── Loft Awareness ────────────────────────────────────────────────────────
+  // If the tentative scale yields a ceiling above LOFT_THRESHOLD_M, the space
+  // is double-height or a loft. Architectural averages are unreliable in these
+  // spaces, so boost Furniture Ladder (bed) anchor weights and recompute.
+  if (ceilingMeshHeight && ceilingMeshHeight > 0) {
+    const tentativeCeiling = factor * ceilingMeshHeight;
+    if (tentativeCeiling > LOFT_THRESHOLD_M) {
+      const bedSurvivors = survivors.filter((m) => isBedMatch(m));
+      if (bedSurvivors.length > 0) {
+        for (const m of bedSurvivors) {
+          m.finalWeight = +(m.finalWeight * LOFT_BED_BOOST).toFixed(4);
+        }
+        const loftFactor = weightedAvg(survivors);
+        console.log(
+          `[SemanticScale] Loft detected (tentative ceiling=${tentativeCeiling.toFixed(2)}m > ` +
+          `${LOFT_THRESHOLD_M}m): Furniture Ladder weight boosted ×${LOFT_BED_BOOST} → ` +
+          `factor=${factor}× → ${loftFactor}×.`,
+        );
+        factor = loftFactor;
+      }
+    }
+  }
+
   // ── Reality Filter (Gaussian Clamp) ───────────────────────────────────────
   // If this scale maps the mesh ceiling outside human architectural norms,
   // it means low-weight objects (windows, doors) are distorting the result.
@@ -249,10 +272,38 @@ export function computeScaleFactor(
     }
   }
 
+  // ── Consensus Validation ──────────────────────────────────────────────────
+  // If the Bed matched Queen AND a Sofa's raw width × factor ≈ SOFA_STANDARD_LENGTH,
+  // both furniture anchors agree — lock the scale and log the consensus.
+  if (chosenBedLabel === "Queen") {
+    const sofaMatch = survivors.find((m) => /\bsofa\b|\bcouch\b|\bsectional\b/i.test(m.objectName));
+    if (sofaMatch) {
+      const sofaObj  = candidates.find((o) => o.uid === sofaMatch.uid);
+      const sofaRawWidth = sofaObj?.rawDimensions?.width ?? 0;
+      if (sofaRawWidth > 0) {
+        const sofaScaledLength = sofaRawWidth * factor;
+        const sofaDeviation    = Math.abs(sofaScaledLength - SOFA_STANDARD_LENGTH) / SOFA_STANDARD_LENGTH;
+        if (sofaDeviation <= CONSENSUS_TOLERANCE) {
+          console.log(
+            `[SemanticScale] ✓ Consensus lock: Bed=Queen (1.5m) + Sofa length=` +
+            `${sofaScaledLength.toFixed(2)}m ≈ ${SOFA_STANDARD_LENGTH}m ` +
+            `(deviation=${(sofaDeviation * 100).toFixed(1)}%). Scale factor locked at ${factor}×.`,
+          );
+        } else {
+          console.log(
+            `[SemanticScale] Consensus check: Bed=Queen but Sofa scaled length=` +
+            `${sofaScaledLength.toFixed(2)}m (expected ≈${SOFA_STANDARD_LENGTH}m, ` +
+            `deviation=${(sofaDeviation * 100).toFixed(1)}% > ${CONSENSUS_TOLERANCE * 100}%) — no lock.`,
+          );
+        }
+      }
+    }
+  }
+
   // ── Sanity Floor Reality Check ────────────────────────────────────────────
   // If the resulting ceiling height is below the architectural minimum, the
   // scale is still too small. Boost using Override Factor A (ceiling target)
-  // and/or Override Factor B (bed width target), taking the larger.
+  // and/or Override Factor B (ladder-selected bed width), taking the larger.
   if (ceilingMeshHeight && ceilingMeshHeight > 0) {
     const resultingCeiling = +(factor * ceilingMeshHeight).toFixed(3);
     if (resultingCeiling < MIN_CEILING_HEIGHT) {
@@ -264,15 +315,16 @@ export function computeScaleFactor(
       // Override Factor A — push ceiling to 2.4 m (comfortable residential target)
       const factorA = +(2.4 / ceilingMeshHeight).toFixed(4);
 
-      // Override Factor B — use bed width if a Bed anchor was matched
-      const bedMatch = matches.find((m) => /\bbed\b/i.test(m.objectName) && m.measuredValue > 0);
+      // Override Factor B — use the ladder-selected bed suggestedFactor if a Bed was matched
+      const bedMatch = matches.find((m) => isBedMatch(m) && m.measuredValue > 0);
       let newFactor = factorA;
 
       if (bedMatch) {
-        const factorB = +(TARGET_BED_WIDTH / bedMatch.measuredValue).toFixed(4);
+        // bedMatch.suggestedFactor already encodes the nearest-neighbour ladder selection
+        const factorB = bedMatch.suggestedFactor;
         console.log(
           `[SemanticScale] Override Factor A (ceiling)=${factorA}× | ` +
-          `Override Factor B (bed width)=${factorB}×`,
+          `Override Factor B (${chosenBedLabel ?? "Bed"} width)=${factorB}×`,
         );
         newFactor = Math.max(factorA, factorB);
       } else {
