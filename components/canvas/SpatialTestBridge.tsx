@@ -66,6 +66,16 @@ export function SpatialTestBridge() {
         /** Dynamically detected room enclosure — use in tests to verify measurements are in-bounds. */
         dynamicBounds,
 
+        /**
+         * Directly patch Zustand store state for test setup.
+         * Use sparingly — prefer realistic interactions where possible.
+         * Example: setState({ _vectorSynced: true, spatialDigest: {...} })
+         */
+        setState: (partial: object) => useAeroStore.setState(partial as Parameters<typeof useAeroStore.setState>[0]),
+
+        /** Read a snapshot of the current store state. */
+        getState: () => useAeroStore.getState(),
+
         ready: true,
       };
     }

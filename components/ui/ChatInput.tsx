@@ -2,7 +2,7 @@
 
 import { useState, useRef, KeyboardEvent } from "react";
 import { useAeroStore } from "@/store/useAeroStore";
-import { AnchorMatch } from "@/utils/semanticScale";
+import { AnchorMatch, ScaleVector3 } from "@/utils/semanticScale";
 
 /** Tailwind color class for a volumeAccuracy score. */
 function accuracyColor(score: number): string {
@@ -13,12 +13,12 @@ function accuracyColor(score: number): string {
 
 /** Compact read-out of the Semantic Scale Calibration state. */
 function ScaleIndicator({
-  scaleFactor,
+  globalScale,
   verifiedScaleFactor,
   anchorLog,
   setVerifiedScaleFactor,
 }: {
-  scaleFactor: number;
+  globalScale: ScaleVector3 | null;
   verifiedScaleFactor: number | null;
   anchorLog: AnchorMatch[];
   setVerifiedScaleFactor: (v: number | null) => void;
@@ -27,16 +27,21 @@ function ScaleIndicator({
   const [draft,   setDraft]   = useState("");
 
   const includedAnchors = anchorLog.filter((m) => m.included);
-  const effectiveFactor = verifiedScaleFactor ?? scaleFactor;
 
   // Only show when there's actual calibration data.
-  if (anchorLog.length === 0 && verifiedScaleFactor == null) return null;
+  if (!globalScale || (anchorLog.length === 0 && verifiedScaleFactor == null)) return null;
 
-  const isVerified = verifiedScaleFactor != null;
-  const label      = isVerified ? "Tape Measure" : "Auto-Calibrated";
-  const color      = isVerified ? "text-amber-300" : "text-emerald-300";
+  const isVerified  = verifiedScaleFactor != null;
+  const label       = isVerified ? "Tape Measure" : "Auto-Calibrated";
+  const color       = isVerified ? "text-amber-300" : "text-emerald-300";
   const borderColor = isVerified ? "border-amber-500/30" : "border-emerald-500/30";
-  const bgColor     = isVerified ? "bg-amber-500/10"    : "bg-emerald-500/10";
+  const bgColor     = isVerified ? "bg-amber-500/10"     : "bg-emerald-500/10";
+
+  // Axes are uniform when all three values match within floating-point noise.
+  const axesUniform = Math.abs(globalScale.x - globalScale.y) < 0.001 &&
+                      Math.abs(globalScale.x - globalScale.z) < 0.001;
+  // Displayed factor for the override input seed.
+  const displayFactor = globalScale.x;
 
   function commitEdit() {
     const n = parseFloat(draft);
@@ -51,7 +56,13 @@ function ScaleIndicator({
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className={`h-3 w-3 shrink-0 ${color}`}>
           <path fillRule="evenodd" d="M.99 5.24A2.25 2.25 0 013.25 3h13.5A2.25 2.25 0 0119 5.25l.01 9.5A2.25 2.25 0 0116.76 17H3.26A2.25 2.25 0 011 14.74l-.01-9.5zm8.26 9.52v-.001a.75.75 0 00.75.75h1.5a.75.75 0 00.75-.75v-4.5a.75.75 0 00-.75-.75h-1.5a.75.75 0 00-.75.75v4.5zm-3.5 0v.001a.75.75 0 00.75.75H8a.75.75 0 00.75-.75v-2.5A.75.75 0 008 11.5H6.5a.75.75 0 00-.75.75v2.5zm7 0v.001a.75.75 0 00.75.75h1.5a.75.75 0 00.75-.75v-2.5a.75.75 0 00-.75-.75H13.5a.75.75 0 00-.75.75v2.5z" clipRule="evenodd" />
         </svg>
-        <span className={`font-semibold ${color}`}>{effectiveFactor.toFixed(3)}×</span>
+        {axesUniform ? (
+          <span className={`font-semibold ${color}`}>{displayFactor.toFixed(3)}×</span>
+        ) : (
+          <span className={`font-semibold ${color}`}>
+            X:{globalScale.x.toFixed(3)} Y:{globalScale.y.toFixed(3)} Z:{globalScale.z.toFixed(3)}
+          </span>
+        )}
         <span className="text-white/40">{label}</span>
         {includedAnchors.length > 0 && (
           <span className="text-white/30">
@@ -72,7 +83,7 @@ function ScaleIndicator({
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") commitEdit(); if (e.key === "Escape") setEditing(false); }}
-              placeholder={effectiveFactor.toFixed(3)}
+              placeholder={displayFactor.toFixed(3)}
               className="w-16 rounded border border-white/20 bg-black/40 px-1.5 py-0.5 text-[10px] text-white outline-none focus:border-amber-400/60"
             />
             <button onClick={commitEdit} className="text-emerald-400 hover:text-emerald-300 transition-colors text-[10px] font-medium">Set</button>
@@ -81,8 +92,8 @@ function ScaleIndicator({
         ) : (
           <>
             <button
-              onClick={() => { setDraft(effectiveFactor.toFixed(3)); setEditing(true); }}
-              title="Enter tape-measure override"
+              onClick={() => { setDraft(displayFactor.toFixed(3)); setEditing(true); }}
+              title="Enter tape-measure uniform override"
               className="rounded px-1.5 py-0.5 text-[10px] text-white/30 hover:bg-white/10 hover:text-white/60 transition-colors"
             >
               Override
@@ -122,8 +133,10 @@ export function ChatInput() {
   const isTouring            = useAeroStore((s) => s.isTouring);
   const startTour            = useAeroStore((s) => s.startTour);
   const roomDimensions       = useAeroStore((s) => s.roomDimensions);
-  const scaleFactor          = useAeroStore((s) => s.scaleFactor);
+  const globalScale          = useAeroStore((s) => s.globalScale);
   const verifiedScaleFactor  = useAeroStore((s) => s.verifiedScaleFactor);
+  const rulerActive          = useAeroStore((s) => s.rulerActive);
+  const setRulerActive       = useAeroStore((s) => s.setRulerActive);
   const anchorLog            = useAeroStore((s) => s.anchorLog);
   const setVerifiedScaleFactor = useAeroStore((s) => s.setVerifiedScaleFactor);
 
@@ -182,6 +195,22 @@ export function ChatInput() {
               Tour
             </button>
           )}
+
+          {/* Reference Ruler — toggles floor-click measurement mode */}
+          <button
+            onClick={() => setRulerActive(!rulerActive)}
+            title={rulerActive ? "Cancel ruler — click two points on the floor" : "Reference Ruler — measure real-world distance"}
+            className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+              rulerActive
+                ? "border-cyan-400/60 bg-cyan-400/20 text-cyan-300 hover:bg-cyan-400/30"
+                : "border-white/20 bg-white/8 text-white/50 hover:bg-white/15 hover:text-white/80"
+            }`}
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-3.5 w-3.5">
+              <path fillRule="evenodd" d="M.99 5.24A2.25 2.25 0 013.25 3h13.5A2.25 2.25 0 0119 5.25l.01 9.5A2.25 2.25 0 0116.76 17H3.26A2.25 2.25 0 011 14.74l-.01-9.5zm8.26 9.52v-.001a.75.75 0 00.75.75h1.5a.75.75 0 00.75-.75v-4.5a.75.75 0 00-.75-.75h-1.5a.75.75 0 00-.75.75v4.5zm-3.5 0v.001a.75.75 0 00.75.75H8a.75.75 0 00.75-.75v-2.5A.75.75 0 008 11.5H6.5a.75.75 0 00-.75.75v2.5zm7 0v.001a.75.75 0 00.75.75h1.5a.75.75 0 00.75-.75v-2.5a.75.75 0 00-.75-.75H13.5a.75.75 0 00-.75.75v2.5z" clipRule="evenodd" />
+            </svg>
+            {rulerActive ? "Ruler ON" : "Ruler"}
+          </button>
 
           {/* Deep Scan — secondary */}
           <button
@@ -262,6 +291,14 @@ export function ChatInput() {
                   <span className="text-[9px] font-normal leading-none text-sky-400/80">
                     Opening
                   </span>
+                ) : obj.scaleValidation === "high-confidence" ? (
+                  <span className="text-[9px] font-normal leading-none text-emerald-400">
+                    ✓✓ Scale OK
+                  </span>
+                ) : obj.scaleValidation === "scale-conflict" ? (
+                  <span className="text-[9px] font-normal leading-none text-amber-400">
+                    ⚠ Scale conflict
+                  </span>
                 ) : hasAccuracy ? (
                   <span className={`text-[9px] font-normal leading-none ${accuracyColor(obj.volumeAccuracy!)}`}>
                     {obj.volumeAccuracy}% accuracy
@@ -275,7 +312,7 @@ export function ChatInput() {
 
       {/* ── Scale calibration indicator ── */}
       <ScaleIndicator
-        scaleFactor={scaleFactor}
+        globalScale={globalScale}
         verifiedScaleFactor={verifiedScaleFactor}
         anchorLog={anchorLog}
         setVerifiedScaleFactor={setVerifiedScaleFactor}

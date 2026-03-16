@@ -8,12 +8,14 @@
     "start": "next start",
     "lint": "eslint",
     "test": "playwright test",
-    "test:ui": "playwright test --ui"
+    "test:ui": "playwright test --ui",
+    "test:e2e": "playwright test tests/spatial-intelligence.spec.ts"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
     "@react-three/drei": "^10.7.7",
     "@react-three/fiber": "^9.5.0",
+    "@supabase/supabase-js": "^2.99.1",
     "@types/three": "^0.183.1",
     "maath": "^0.10.8",
     "next": "16.1.6",

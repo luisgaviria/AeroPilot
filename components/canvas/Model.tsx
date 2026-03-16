@@ -13,6 +13,7 @@ export function Model(props: ModelProps) {
   const { scene } = useGLTF("/models/apartment.glb");
   const centeredRef = useRef(false);
   const setRoomDimensions = useAeroStore((s) => s.setRoomDimensions);
+  const setGltfScene      = useAeroStore((s) => s.setGltfScene);
 
   // Runs synchronously on the first render — before any useFrame or raycasting.
   // Centers the GLTF so its bounding-box XZ midpoint is at world (0, ?, 0) and
@@ -30,7 +31,8 @@ export function Model(props: ModelProps) {
     // post-updateMatrixWorld so all child transforms are current.
     scene.userData.boundingBox = new Box3().setFromObject(scene);
     const dims = getRoomDimensions(scene);
-    setRoomDimensions(dims);
+    setRoomDimensions(dims, "fallback");
+    setGltfScene(scene);
     console.log(
       `[Model] centred — offset (${(-center.x).toFixed(2)}, ${(-box.min.y).toFixed(2)}, ${(-center.z).toFixed(2)})` +
       ` room ${(box.max.x - box.min.x).toFixed(1)}×${(box.max.y - box.min.y).toFixed(1)}×${(box.max.z - box.min.z).toFixed(1)} m`,

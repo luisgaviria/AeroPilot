@@ -69,11 +69,32 @@ export interface DetectedObject {
   dimensions?: { width: number; height: number; depth: number };
   /**
    * Voxel-measured dimensions before semantic-anchor scale correction.
-   * Preserved so that if the scale factor changes (new anchor found on a later
-   * scan), `dimensions` can be recomputed without degrading precision.
+   * Updated to the higher-confidence reading on re-scan — used by the semantic
+   * anchor engine to derive the global scale factor.
    * Undefined for objects loaded from a legacy checkpoint that pre-dates this field.
    */
   rawDimensions?: { width: number; height: number; depth: number };
+  /**
+   * Immutable voxel measurement captured on the FIRST detection of this object.
+   * Never overwritten by subsequent scans.
+   *
+   * displayedDimensions = rawMeshDimensions × globalScale (per-axis).
+   * This decouples calibration changes from the source measurement so that
+   * adjusting the global scale never degrades measurement precision.
+   */
+  rawMeshDimensions?: { width: number; height: number; depth: number };
+  /**
+   * True when the owner has manually confirmed the exact real-world size of
+   * this specific object (e.g. "this is a 40-inch dining table").
+   * When set, globalScale is bypassed for this object and verifiedDimensions
+   * are used directly as the displayed size.
+   */
+  isUserVerified?: boolean;
+  /**
+   * Owner-confirmed real-world dimensions in metres.
+   * Only meaningful when isUserVerified is true.
+   */
+  verifiedDimensions?: { width: number; height: number; depth: number };
   /**
    * Number of solid voxels in the cluster that produced `dimensions`.
    * Low values (< 30) indicate a sparse or partially-occluded scan.
@@ -99,6 +120,24 @@ export interface DetectedObject {
    * gap sweep rather than the solid-mass BFS engine.
    */
   isOpening?: boolean;
+  /**
+   * Result of the Hybrid Validation pass (run after geometric scaling).
+   *
+   * "high-confidence"  — geometric size agrees with the Semantic Standard within
+   *                      15 %.  The displayed dimensions are a 70/30 blend of
+   *                      room-geometry scale and the semantic standard.
+   * "scale-conflict"   — sizes diverge > 15 %.  Geometric size is kept unchanged;
+   *                      the conflict is surfaced in the Diagnostic Dashboard.
+   *
+   * Undefined for objects with no matching entry in standardAnchors.ts or when
+   * only semantic-anchor (no room-dimension) scaling is in effect.
+   */
+  scaleValidation?: "high-confidence" | "scale-conflict";
+  /**
+   * Human-readable measurement description set when scaleValidation === "scale-conflict".
+   * Example: "Geometric 3'10\" vs standard 3'2\""
+   */
+  scaleConflictMsg?: string;
 }
 
 /**

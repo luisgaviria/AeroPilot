@@ -17,6 +17,14 @@ import {
   Scene as ThreeScene,
 } from "three";
 
+/**
+ * True in development / test builds; false in production.
+ * Used to suppress per-pixel raycaster logs that add Console overhead
+ * without value in deployed builds.  Next.js replaces this at compile time,
+ * so dead-code elimination removes the log branches entirely in production.
+ */
+const DEV = process.env.NODE_ENV !== "production";
+
 // ─── Snapshot ──────────────────────────────────────────────────────────────────
 
 /**
@@ -268,7 +276,7 @@ export function raycastPixelTo3D(
   const primaryRay = makeRay(pixelX, pixelY);
   const primaryHits = primaryRay.intersectObjects(scene.children, true);
 
-  if (primaryHits.length > 0) {
+  if (DEV && primaryHits.length > 0) {
     primaryHits.slice(0, 4).forEach((h) => {
       const r =
         h.object instanceof Mesh ? meshRadius(h.object).toFixed(2) : "n/a";
@@ -286,7 +294,7 @@ export function raycastPixelTo3D(
     const p = best.point;
     const meshR =
       best.object instanceof Mesh ? meshRadius(best.object).toFixed(2) : "?";
-    console.log(
+    if (DEV) console.log(
       `[spatial] ✓ primary  "${
         best.object.name || "(unnamed)"
       }" r=${meshR} dist=${best.distance.toFixed(2)} @ (${p.x.toFixed(
@@ -327,7 +335,7 @@ export function raycastPixelTo3D(
       deepest.object instanceof Mesh
         ? meshRadius(deepest.object).toFixed(2)
         : "?";
-    console.log(
+    if (DEV) console.log(
       `[spatial] ✓ greedy-bundle "${meshName}" r=${meshR} dist=${deepest.distance.toFixed(
         2
       )} @ (${p.x.toFixed(2)},${p.y.toFixed(2)},${p.z.toFixed(2)})`
@@ -343,7 +351,7 @@ export function raycastPixelTo3D(
   // 3a. Floor anchor — furniture labels sit on the floor, never float.
   if (isFloorSnap) {
     const grounded = new Vector3(ref.x, 0, ref.z);
-    console.log(
+    if (DEV) console.log(
       `[spatial] ↓ floor-snap "${objectName}" → (${grounded.x.toFixed(
         2
       )}, 0.00, ${grounded.z.toFixed(2)})`
@@ -368,7 +376,7 @@ export function raycastPixelTo3D(
       else snapped.z = nearest.val;
       // Keep Y in the room band
       snapped.y = Math.max(ROOM_Y_MIN, Math.min(ROOM_Y_MAX, snapped.y));
-      console.log(
+      if (DEV) console.log(
         `[spatial] ↓ wall-snap "${objectName}" → (${snapped.x.toFixed(
           2
         )},${snapped.y.toFixed(2)},${snapped.z.toFixed(2)})`
@@ -383,7 +391,7 @@ export function raycastPixelTo3D(
     ref.y >= ROOM_Y_MIN &&
     ref.y <= ROOM_Y_MAX
   ) {
-    console.log(
+    if (DEV) console.log(
       `[spatial] ↓ depth fallback "${
         objectName ?? "?"
       }" @ ${depthFallback}m → (${ref.x.toFixed(2)},${ref.y.toFixed(
@@ -504,6 +512,19 @@ export function getObjectMeshBounds(
      *   (b) ceiling-snap (top boundary within 10 cm of ceiling → extend to touch it)
      */
     roomHeight?: number;
+    /**
+     * Dynamic ground buffer (Clearance Buffer) — vertices below this Y value are
+     * excluded from voxelization, creating an air gap between the floor mass and
+     * the object volume.
+     *
+     * Defaults to FLOOR_VERTEX_MIN (0.20 m) when not set.
+     *   Interior / ≥3 walls detected → 0.08 m  (Clearance Buffer: clears rugs, tiles,
+     *                                            and baseboard geometry without cutting
+     *                                            into low-profile furniture legs)
+     *   Exterior / drone / <3 walls   → 0.35 m  (clears grass, curbs, terrain noise)
+     *   Terrain Guard (tilt > 5°)     → 0.50 m  (prevents terrain-bleed into structures)
+     */
+    bufferHeight?: number;
   }
 ): {
   width: number;
@@ -524,6 +545,8 @@ export function getObjectMeshBounds(
   // VS=0.10 → BFS_HORIZ_SPAN=22 voxels (2.2 m, unchanged)
   // VS=0.05 → BFS_HORIZ_SPAN=44 voxels (2.2 m physical span)
   const BFS_HORIZ_SPAN = Math.round(MAX_BFS_HORIZ_SPAN * (VOXEL_SIZE / VS));
+  // Mode-aware ground buffer: caller supplies context-appropriate value; fall back to default.
+  const effectiveFloorMin = opts?.bufferHeight ?? FLOOR_VERTEX_MIN;
 
   const origin = new Vector3(...centerPos);
   const sphere = new Sphere(origin, searchRadius);
@@ -575,10 +598,10 @@ export function getObjectMeshBounds(
       vB.fromBufferAttribute(pa, i1).applyMatrix4(obj.matrixWorld);
       vC.fromBufferAttribute(pa, i2).applyMatrix4(obj.matrixWorld);
 
-      // Quick-reject: all three vertices below floor or outside capture sphere
-      const inA = vA.y >= FLOOR_VERTEX_MIN && voxSphere.containsPoint(vA);
-      const inB = vB.y >= FLOOR_VERTEX_MIN && voxSphere.containsPoint(vB);
-      const inC = vC.y >= FLOOR_VERTEX_MIN && voxSphere.containsPoint(vC);
+      // Quick-reject: all three vertices below ground buffer or outside capture sphere
+      const inA = vA.y >= effectiveFloorMin && voxSphere.containsPoint(vA);
+      const inB = vB.y >= effectiveFloorMin && voxSphere.containsPoint(vB);
+      const inC = vC.y >= effectiveFloorMin && voxSphere.containsPoint(vC);
       if (!inA && !inB && !inC) continue;
 
       // Face normal via cross product of triangle edges

@@ -3,6 +3,7 @@
 import { useEffect, useRef } from "react";
 import { useAeroStore } from "@/store/useAeroStore";
 import { TourStop } from "@/types/auto-discovery";
+import { fmtArea, fmtLen } from "@/utils/units";
 
 function certaintColor(score: number): string {
   if (score > 85) return "text-emerald-400";
@@ -22,24 +23,25 @@ function buildNarrative(
   clearance: { totalArea: number; walkableArea: number; spatialCertainty: number } | null,
 ): string {
   if (stop.kind === "corner") {
-    const area      = clearance?.totalArea.toFixed(1)     ?? "–";
-    const walkable  = clearance?.walkableArea.toFixed(1)  ?? "–";
-    const certainty = clearance?.spatialCertainty         ?? 0;
+    const area      = clearance ? fmtArea(clearance.totalArea)    : "–";
+    const walkable  = clearance ? fmtArea(clearance.walkableArea) : "–";
+    const certainty = clearance?.spatialCertainty ?? 0;
     return (
       `Spatial survey from vantage ${stop.cornerIndex + 1}. ` +
-      `Total floor area: ${area} m². Walkable space: ${walkable} m². ` +
+      `Total floor area: ${area}. Walkable space: ${walkable}. ` +
       `Spatial certainty: ${certainty}%.`
     );
   }
   return (
     `Spatial transition detected. ` +
-    `Opening span: ${stop.openingWidth.toFixed(2)} m.`
+    `Opening span: ${fmtLen(stop.openingWidth)}.`
   );
 }
 
 export function TourOverlay() {
   const isTouring        = useAeroStore((s) => s.isTouring);
   const isMoving         = useAeroStore((s) => s.isMoving);
+  const isScanning       = useAeroStore((s) => s.isScanning);
   const tourIndex        = useAeroStore((s) => s.tourIndex);
   const tourStops        = useAeroStore((s) => s.tourStops);
   const spatialClearance = useAeroStore((s) => s.spatialClearance);
@@ -62,9 +64,12 @@ export function TourOverlay() {
     }
   }, [tourIndex, isTouring]);
 
-  // Once the camera settles, push narrative and schedule auto-advance
+  // Once the camera settles AND any concurrent scan (+ scale pass) has
+  // finished, push narrative and schedule auto-advance.
+  // Waiting for !isScanning prevents flickering measurements caused by the
+  // semantic scale calculation running concurrently with the first render.
   useEffect(() => {
-    if (!isTouring || isMoving || settledRef.current || !stop) return;
+    if (!isTouring || isMoving || isScanning || settledRef.current || !stop) return;
     settledRef.current = true;
 
     setAiMessage(buildNarrative(stop, spatialClearance));
@@ -79,7 +84,7 @@ export function TourOverlay() {
         autoAdvanceRef.current = null;
       }
     };
-  }, [isMoving, isTouring, tourIndex, stop, spatialClearance, setAiMessage, tourAdvance]);
+  }, [isMoving, isScanning, isTouring, tourIndex, stop, spatialClearance, setAiMessage, tourAdvance]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -138,7 +143,7 @@ export function TourOverlay() {
                 Floor Area
               </span>
               <span className="text-sm font-semibold text-white">
-                {sc.totalArea.toFixed(1)} m²
+                {fmtArea(sc.totalArea)}
               </span>
             </div>
             <div className="flex flex-col rounded-xl border border-white/10 bg-white/5 px-3 py-2">
@@ -146,7 +151,7 @@ export function TourOverlay() {
                 Walkable
               </span>
               <span className="text-sm font-semibold text-white">
-                {sc.walkableArea.toFixed(1)} m²
+                {fmtArea(sc.walkableArea)}
               </span>
             </div>
             <div className="flex flex-col rounded-xl border border-white/10 bg-white/5 px-3 py-2">
@@ -167,7 +172,7 @@ export function TourOverlay() {
                 Opening Span
               </span>
               <span className="text-sm font-semibold text-sky-200">
-                {stop.openingWidth.toFixed(2)} m
+                {fmtLen(stop.openingWidth)}
               </span>
             </div>
             <div className="flex flex-col rounded-xl border border-white/10 bg-white/5 px-3 py-2">

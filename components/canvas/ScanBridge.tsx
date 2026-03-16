@@ -14,6 +14,7 @@ import {
   ROOM_Y_MAX,
 } from "@/utils/spatial";
 import { IncomingDetection, VisionObject } from "@/types/auto-discovery";
+import { STANDARD_ANCHORS } from "@/data/standardAnchors";
 
 type BatchEntry = {
   snap: ReturnType<typeof captureSnapshotFromCamera>;
@@ -22,9 +23,10 @@ type BatchEntry = {
 
 export function ScanBridge() {
   const { gl, camera, scene } = useThree();
-  const pendingScan    = useAeroStore((s) => s.pendingScan);
-  const isDeepScanning = useAeroStore((s) => s.isDeepScanning);
-  const batchRef       = useRef<BatchEntry[]>([]);
+  const pendingScan         = useAeroStore((s) => s.pendingScan);
+  const isDeepScanning      = useAeroStore((s) => s.isDeepScanning);
+  const pendingIsolationUIDs = useAeroStore((s) => s.pendingIsolationUIDs);
+  const batchRef             = useRef<BatchEntry[]>([]);
 
   useEffect(() => {
     if (!pendingScan) return;
@@ -34,7 +36,36 @@ export function ScanBridge() {
         resolveScan,
         deepScanProgress,
         deepScanTotal,
+        spatialDiagnostics,
+        globalScale,
       } = useAeroStore.getState();
+
+      // ── Multi-Signal Environment Detection ────────────────────────────────
+      // Human truth (a verified axis dimension) overrides unreliable sensor
+      // data (wall count).  Even a single verified axis guarantees we are in
+      // an interior — a partial sensor read should never force exterior mode.
+      const bp = spatialDiagnostics?.boundaryPlanes;
+      const wallsDetected = bp
+        ? [bp.wallN, bp.wallS, bp.wallE, bp.wallW].filter(Boolean).length
+        : 0;
+      const { verifiedXAxis, verifiedYAxis, verifiedZAxis } = useAeroStore.getState();
+      const hasVerifiedAxis = verifiedXAxis != null || verifiedYAxis != null || verifiedZAxis != null;
+      const isInterior = wallsDetected >= 2 || hasVerifiedAxis;
+      const verticalityError = spatialDiagnostics?.verticalityError ?? 0;
+
+      // Interior: 8 cm Clearance Buffer — creates a geometric air gap that prevents
+      // rug/tile mass from inflating the volume of floor-based objects, without
+      // cutting into low-profile furniture legs (typical leg height ≥ 10 cm).
+      // Exterior/drone: wider 35 cm buffer clears grass, curbs, and terrain noise.
+      let bufferHeight = isInterior ? 0.08 : 0.35;
+      // Terrain Guard: steep tilt on uneven terrain inflates buffer to prevent bleed.
+      if (verticalityError > 5) bufferHeight = 0.5;
+
+      console.log(
+        `[SpatialPilot] Mode: ${isInterior ? "Room" : "Exterior"} ` +
+        `(walls=${wallsDetected}, verifiedAxis=${hasVerifiedAxis}) | ` +
+        `Buffer: ${bufferHeight}m | Scale Priority: UserTruth`
+      );
 
       try {
         const frozenCamera = freezeCamera(camera);
@@ -86,7 +117,7 @@ export function ScanBridge() {
           center3D: Vector3Tuple,
         ): { dims: { width: number; height: number; depth: number }; center: Vector3Tuple; voxelCount: number; clipping_warning?: boolean } | null {
           const INITIAL_RADIUS = 2.5;
-          let result = getObjectMeshBounds(scene, center3D, INITIAL_RADIUS, obj.name, { roomHeight });
+          let result = getObjectMeshBounds(scene, center3D, INITIAL_RADIUS, obj.name, { roomHeight, bufferHeight });
           if (!result) return null;
 
           // ── Adaptive refinement: if a large-label object has a small footprint,
@@ -105,7 +136,7 @@ export function ScanBridge() {
               center3D,
               refinedRadius,
               obj.name,
-              { neckMinWidth: 1, roomHeight },
+              { neckMinWidth: 1, roomHeight, bufferHeight },
             );
             if (refined && refined.width * refined.depth > result.width * result.depth) {
               console.log(
@@ -125,12 +156,26 @@ export function ScanBridge() {
               `Reported size may be truncated.`
             );
           }
+
+          // ── Point 3: Normalize to raw mesh units ───────────────────────────
+          // Divide by the current globalScale so rawMeshDimensions are stored in
+          // pre-scale coordinates.  reapplyAndValidate then applies globalScale to
+          // produce the calibrated real-world measurement, preventing double-scaling
+          // when globalScale ≠ 1 (e.g. after a ruler commit or verified dimension).
+          const gx = Math.max(globalScale.x, 0.01);
+          const gy = Math.max(globalScale.y, 0.01);
+          const gz = Math.max(globalScale.z, 0.01);
+          const normW = +(width  / gx).toFixed(3);
+          const normH = +(height / gy).toFixed(3);
+          const normD = +(depth  / gz).toFixed(3);
+
           console.log(
             `[ScanBridge] "${obj.name}" voxel: ${width}×${height}×${depth} m ` +
+            `→ normalized: ${normW}×${normH}×${normD} (÷ gs ${gx.toFixed(3)}/${gy.toFixed(3)}/${gz.toFixed(3)}) ` +
             `cluster-center=(${center.map((n) => n.toFixed(2)).join(", ")}) ` +
             `voxels=${voxelCount}${clipping_warning ? " ⚠ CLIPPED" : ""}`
           );
-          return { dims: { width, height, depth }, center, voxelCount, clipping_warning };
+          return { dims: { width: normW, height: normH, depth: normD }, center, voxelCount, clipping_warning };
         }
 
         /** Pause until the tab is visible; polls every 1 s while hidden. */
@@ -344,6 +389,12 @@ export function ScanBridge() {
             `[ScanBridge] Batch complete — ${allDetections.length} total detections from ${batch.length} passes`
           );
           resolveScan(allDetections);
+          // Auto-save only when detections were actually collected
+          if (allDetections.length > 0) {
+            useAeroStore.getState().saveCurrentRoom().catch((err) =>
+              console.error("[ScanBridge] Auto-save (deep scan) failed:", err)
+            );
+          }
         } else {
           // Single scan: two passes (normal + 2° jitter) — merge before resolving.
           const [pass1, pass2] = await Promise.all([
@@ -355,6 +406,10 @@ export function ScanBridge() {
             `[ScanBridge] Jitter merge — pass1: ${pass1.length}, pass2: ${pass2.length}, total: ${detected.length}`
           );
           resolveScan(detected);
+          // Auto-save after every successful single scan
+          useAeroStore.getState().saveCurrentRoom().catch((err) =>
+            console.error("[ScanBridge] Auto-save (scan) failed:", err)
+          );
         }
       } catch (err) {
         console.error("[ScanBridge] Scan pipeline failed:", err);
@@ -365,6 +420,95 @@ export function ScanBridge() {
 
     runScan();
   }, [pendingScan, gl, camera, scene, isDeepScanning]);
+
+  // ── Voxel Isolation — targeted re-measurement for Sanity Guard triggers ────
+  useEffect(() => {
+    if (pendingIsolationUIDs.length === 0) return;
+
+    const {
+      detectedObjects, resolveVoxelIsolation, roomDimensions,
+      spatialDiagnostics,
+    } = useAeroStore.getState();
+    const roomHeight = roomDimensions?.height;
+
+    // ── Multi-Signal isolation context ────────────────────────────────────
+    const ibp = spatialDiagnostics?.boundaryPlanes;
+    const iWallsDetected = ibp
+      ? [ibp.wallN, ibp.wallS, ibp.wallE, ibp.wallW].filter(Boolean).length
+      : 0;
+    const { verifiedXAxis: ivX, verifiedYAxis: ivY, verifiedZAxis: ivZ } = useAeroStore.getState();
+    const iHasVerifiedAxis = ivX != null || ivY != null || ivZ != null;
+    const iIsInterior = iWallsDetected >= 2 || iHasVerifiedAxis;
+    const iVertError = spatialDiagnostics?.verticalityError ?? 0;
+    let iBufferHeight = iIsInterior ? 0.08 : 0.35;
+    if (iVertError > 5) iBufferHeight = 0.5;
+
+    // Exterior structures (buildings, facades) get a double-wide radius so the
+    // voxel engine can find the full footprint, but the bottom-cut stays in place
+    // so the house doesn't merge with the driveway or ground mesh.
+    const EXTERIOR_STRUCTURE_RE = /building|structure|house|facade|exterior|barn|shed/i;
+    const BASE_ISOLATION_RADIUS = 5.0;
+
+    for (const uid of pendingIsolationUIDs) {
+      const obj = detectedObjects.find((o) => o.uid === uid);
+      if (!obj) {
+        resolveVoxelIsolation(uid, null);
+        continue;
+      }
+
+      const isExteriorStructure = EXTERIOR_STRUCTURE_RE.test(obj.name);
+      const isolationRadius = isExteriorStructure ? BASE_ISOLATION_RADIUS * 2 : BASE_ISOLATION_RADIUS;
+
+      // ── Point 5: Performance Check — neck detection only when significantly diverged ──
+      // Neck detection (neckMinWidth BFS) is expensive. Only run it when the object's
+      // current width overshoots the anchor's sanityMax by >20%, which indicates genuine
+      // merged-geometry contamination. A marginal overshoot (<20%) doesn't justify the
+      // CPU cost — a plain radius/buffer adjustment is sufficient.
+      const iAnchor = STANDARD_ANCHORS.find((a) => a.pattern.test(obj.name));
+      const currentW = obj.dimensions?.width ?? 0;
+      const sanityDiv = iAnchor?.sanityMax && iAnchor.sanityMax > 0
+        ? (currentW - iAnchor.sanityMax) / iAnchor.sanityMax
+        : 0;
+      const useNeckDetection = sanityDiv > 0.20;
+
+      console.log(
+        `[ScanBridge] Voxel Isolation for "${obj.name}" (uid=${uid}) ` +
+        `mode=${iIsInterior ? "Room" : "Exterior"} ` +
+        `buffer=${iBufferHeight}m radius=${isolationRadius}m ` +
+        `neckDetect=${useNeckDetection} (sanityDiv=${(sanityDiv * 100).toFixed(0)}%)` +
+        `${isExteriorStructure ? " [exterior structure — wide radius, bottom-cut held]" : ""} ` +
+        `at (${obj.position3D.map((n) => n.toFixed(2)).join(", ")})`
+      );
+
+      const isolated = getObjectMeshBounds(
+        scene,
+        obj.position3D,
+        isolationRadius,
+        obj.name,
+        { neckMinWidth: useNeckDetection ? 1 : undefined, roomHeight, bufferHeight: iBufferHeight },
+      );
+
+      if (isolated) {
+        const { width, height, depth } = isolated;
+        console.log(
+          `[ScanBridge] Voxel Isolation "${obj.name}" raw result: ` +
+          `${width.toFixed(3)}×${height.toFixed(3)}×${depth.toFixed(3)} m ` +
+          `(normalisation to unscaled space delegated to resolveVoxelIsolation)`
+        );
+        // Pass raw Three.js world-unit dims — resolveVoxelIsolation owns the
+        // ÷ globalScale invariant so rawMeshDimensions is always in 1.0× space.
+        resolveVoxelIsolation(uid, { width, height, depth });
+      } else {
+        console.warn(`[ScanBridge] Voxel Isolation "${obj.name}" — no geometry found, keeping original`);
+        resolveVoxelIsolation(uid, null);
+      }
+    }
+
+    // Auto-save after all isolation passes resolve — dimensions may have changed
+    useAeroStore.getState().saveCurrentRoom().catch((err) =>
+      console.error("[ScanBridge] Auto-save (isolation) failed:", err)
+    );
+  }, [pendingIsolationUIDs, scene]);
 
   return null;
 }

@@ -2,13 +2,15 @@
 
 import { Canvas } from "@react-three/fiber";
 import { Suspense } from "react";
-import { Environment, Html } from "@react-three/drei";
+import { Environment, Html, Line } from "@react-three/drei";
 import { useAeroStore } from "@/store/useAeroStore";
 import { DetectedObject } from "@/types/auto-discovery";
+import { Vector3Tuple } from "three";
 import { Model } from "./Model";
 import { CameraRig } from "./CameraRig";
 import { ScanBridge } from "./ScanBridge";
 import { SpatialTestBridge } from "./SpatialTestBridge";
+import { DiagnosticsProbe } from "./DiagnosticsProbe";
 
 /**
  * AR-style HTML label anchored to a 3D world position.
@@ -67,6 +69,64 @@ function SpatialLabel({ obj }: { obj: DetectedObject }) {
   );
 }
 
+/**
+ * Large invisible floor plane that intercepts pointer clicks during Reference Ruler mode.
+ * Clicking anywhere on the floor records the world-space position as a ruler point.
+ */
+function RulerCapturePlane() {
+  const rulerActive  = useAeroStore((s) => s.rulerActive);
+  const addRulerPoint = useAeroStore((s) => s.addRulerPoint);
+
+  if (!rulerActive) return null;
+
+  return (
+    <mesh
+      position={[0, 0.005, 0]}
+      rotation={[-Math.PI / 2, 0, 0]}
+      onPointerDown={(e) => {
+        e.stopPropagation();
+        addRulerPoint([e.point.x, e.point.y, e.point.z] as Vector3Tuple);
+      }}
+    >
+      <planeGeometry args={[400, 400]} />
+      {/* Fully transparent — only exists to receive pointer events */}
+      <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+    </mesh>
+  );
+}
+
+/**
+ * Renders cyan/amber spheres at placed ruler points and a dashed line between them.
+ * Only visible while ruler mode is active.
+ */
+function RulerMarkers() {
+  const rulerPoints = useAeroStore((s) => s.rulerPoints);
+  const rulerActive = useAeroStore((s) => s.rulerActive);
+
+  if (!rulerActive || rulerPoints.length === 0) return null;
+
+  return (
+    <>
+      {rulerPoints.map((pt, i) => (
+        <mesh key={i} position={pt}>
+          <sphereGeometry args={[0.06, 16, 16]} />
+          <meshBasicMaterial color={i === 0 ? "#22d3ee" : "#f59e0b"} />
+        </mesh>
+      ))}
+      {rulerPoints.length === 2 && (
+        <Line
+          points={rulerPoints}
+          color="#22d3ee"
+          lineWidth={2}
+          dashed
+          dashSize={0.12}
+          gapSize={0.06}
+        />
+      )}
+    </>
+  );
+}
+
 /** Renders a persistent AR label for every detected object (hidden during cinematic tour). */
 function SpatialLabels() {
   const detectedObjects = useAeroStore((s) => s.detectedObjects);
@@ -109,6 +169,13 @@ export function Scene() {
 
       {/* AR labels for all detected objects */}
       <SpatialLabels />
+
+      {/* Geometry diagnostics + floor-snap handler */}
+      <DiagnosticsProbe />
+
+      {/* Reference Ruler — invisible capture plane + marker spheres */}
+      <RulerCapturePlane />
+      <RulerMarkers />
 
       {/* Playwright test bridge — no-ops in production */}
       <SpatialTestBridge />
