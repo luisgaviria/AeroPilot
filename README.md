@@ -133,26 +133,6 @@ NEXT_PUBLIC_SUPABASE_ANON_KEY=your_anon_key</pre>
 - **Diagnostics:** In-app Diagnostic Dashboard — live anchor scores, outlier log, loft/consensus state, manual scale lock UI
 - **Optimization:** Asynchronous Batching (Parallel Promise Queue)
 
-**Scale Calibration Data Flow**
-
-Gemini scan → DetectedObject[] (with rawDimensions + confidence)
-→ Pass 1: match STANDARD_ANCHORS (first-match, classWeighted)
-→ Pass 2: Bed Ladder nearest-neighbour (prelim consensus → best rung)
-→ Weighted median → outlier rejection
-→ Weighted average → initial factor
-→ Loft Awareness (ceiling > 3.5m → boost bed ×1.5)
-→ Reality Filter (ceiling ∈ [2.1m, 7.0m])
-→ Consensus Validation (Bed=Queen ∧ Sofa≈2.1m → lock)
-→ Sanity Floor (ceiling < 2.3m → override A/B)
-→ ScaleResult { factor, matches[] }
-
-**Persistence Data Flow**
-
-Scan complete → SpatialDigest built (objects + factor + timestamp)
-→ Embed via text-embedding-3-large (3072-dim)
-→ Upsert to Supabase spatial_memories table
-→ On next load: fetch nearest embedding → surface drift delta to user
-
 </details>
 
 ---
