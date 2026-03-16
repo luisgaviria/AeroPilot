@@ -47,7 +47,12 @@
   <tr>
     <td width="50%" valign="top">
       <h3>🧠 Weighted Heuristic Scale Engine</h3>
-      A <b>two-pass Semantic Scale system</b> eliminates hardcoded object sizes. Pass 1 matches all detected objects to a Standard Reference Library (classWeights: 1.0 High / 0.4 Medium / 0.1 Low). Pass 2 runs a <b>Bed Ladder</b> nearest-neighbour heuristic — comparing raw mesh width against four standard mattress sizes (Twin 0.9m → King 1.95m) and selecting the rung that requires the least room-wide scale deviation. High-trust furniture anchors (Beds, Sofas, Dining Tables) always outweigh architectural noise such as windows and doorways.
+      The engine avoids hard-coded values by using <b>Probabilistic Class Ladders</b>. 
+Instead of forcing a single size, the system compares raw mesh data against 
+standardized industry ranges (e.g., Mattress Ladders, Seating Standards). 
+It selects the "Rung" that minimizes global architectural deviation, 
+allowing the AI to distinguish between a Twin and a King bed based on 
+the surrounding room volume.
     </td>
     <td width="50%" valign="top">
       <h3>🏗️ Sanity Floor & Loft Mode</h3>
