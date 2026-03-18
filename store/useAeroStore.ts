@@ -3,10 +3,10 @@ import { Object3D, Vector3Tuple } from "three";
 import { locations } from "@/data/locations";
 import { DetectedObject, IncomingDetection, TourStop } from "@/types/auto-discovery";
 import type { RoomDimensions } from "@/utils/spatial";
-import { computeScaleFactor, scaleDims, applyScaleVector, applyHybridValidation, type AnchorMatch, type ScaleVector3 } from "@/utils/semanticScale";
+import { computeScaleFactor, scaleDims, applyScaleVector, applyHybridValidation, applyRawDepthOverrides, type AnchorMatch, type ScaleVector3 } from "@/utils/semanticScale";
 import { STANDARD_ANCHORS } from "@/data/standardAnchors";
 import type { SpatialDiagnostics } from "@/types/diagnostics";
-import { buildSpatialManifest } from "@/utils/diagnostics";
+import { buildSpatialManifest, type SpatialManifest } from "@/utils/diagnostics";
 import type { SpatialDigest } from "@/types/spatialDigest";
 import { buildSpatialDigest, classifyTier, digestFingerprint } from "@/utils/spatialDigest";
 import { supabase } from "@/lib/supabase";
@@ -90,6 +90,13 @@ interface AeroState {
    * Resets detected objects, dimensions, verified axes, digest, and room identity.
    */
   resetForNewScan: () => void;
+  /**
+   * Spatial Sandbox — hydrate the store directly from an exported SpatialManifest JSON.
+   * Instantly restores 3D objects, labels, room dimensions, and scale factor from a
+   * previously saved scan file.  No API call is made; the manifest is the ground truth.
+   * Safe to call repeatedly to switch between different scan files.
+   */
+  loadSandboxManifest: (manifest: SpatialManifest) => void;
   /**
    * Tri-state embedding status for the last saveCurrentRoom call.
    *   null  — no save attempted yet in this session.
@@ -1175,6 +1182,77 @@ export const useAeroStore = create<AeroState>((set, get) => ({
     console.log("[AeroPilot] Store reset for new scan.");
   },
 
+  // ── Spatial Sandbox ──────────────────────────────────────────────────────────
+  loadSandboxManifest: (manifest: SpatialManifest) => {
+    if (manifest.schema !== "vista-spatial-manifest/v1") {
+      console.warn("[Sandbox] Unknown manifest schema:", manifest.schema);
+      return;
+    }
+
+    const room      = manifest.room;
+    const effective = manifest.scale.effective;
+
+    // Reconstruct DetectedObject[] — pixelCoords and scanCount are not stored in the
+    // manifest; supply sensible defaults so downstream label / voxel code is satisfied.
+    const restoredObjects: DetectedObject[] = manifest.objects.map((o) => ({
+      uid:               o.uid,
+      name:              o.name,
+      position3D:        o.position,
+      pixelCoords:       { x: 0, y: 0 },
+      scanCount:         1,
+      confidence:        o.confidence,
+      dimensions:        o.dimensions,
+      rawDimensions:     o.rawDimensions,
+      rawMeshDimensions: o.rawDimensions, // best available substitute for the original mesh baseline
+      isOpening:         o.isOpening,
+      volumeAccuracy:    o.volumeAccuracy,
+    }));
+
+    const rd: RoomDimensions = {
+      width:     room.width,
+      length:    room.length,
+      height:    room.height,
+      floorArea: room.floorArea ?? +(room.width * room.length).toFixed(2),
+    };
+
+    const digest    = buildSpatialDigest(restoredObjects, rd);
+    const digestKey = digestFingerprint(restoredObjects, rd);
+
+    // Clear any persisted Scale Lock — the manifest's effective scale is the ground truth
+    // and a locked factor from a previous session would silently override it.
+    if (typeof window !== "undefined") localStorage.removeItem(LOCKED_SCALE_KEY);
+
+    set({
+      roomDimensions:      rd,
+      autoScaleFactor:     manifest.scale.auto,
+      verifiedScaleFactor: manifest.scale.verified,
+      globalScale:         { x: effective, y: effective, z: effective },
+      _lockedScale:        null,
+      detectedObjects:     restoredObjects,
+      spatialDiagnostics:  manifest.diagnostics,
+      anchorLog:           [],
+      spatialDigest:       digest,
+      _digestKey:          digestKey,
+      // Clear per-axis overrides — the manifest's effective scale is the ground truth
+      verifiedYAxis:       null,
+      verifiedXAxis:       null,
+      verifiedZAxis:       null,
+      metricRatio:         null,
+      _rulerRatio:         null,
+      _baseMeshDimensions: rd,
+      ceilingHeightSource: "measured" as const,
+      currentRoomName:     null,
+      currentRoomId:       null,
+      persistedStats:      null,
+      _vectorSynced:       null as boolean | null,
+    });
+
+    console.log(
+      `[Sandbox] Hydrated from manifest — room: ${room.width}×${room.length}×${room.height}m, ` +
+      `${restoredObjects.length} object(s), effective scale=${effective}×`,
+    );
+  },
+
   // ── AI Chat ─────────────────────────────────────────────────────────────────
 
   sendMessage: async (userMessage: string) => {
@@ -1975,8 +2053,8 @@ export const useAeroStore = create<AeroState>((set, get) => ({
     // When the scale is locked, skip semantic anchor computation entirely — the
     // locked factor IS the ground truth and nothing from the scan should change it.
     const scaleResult = (_lockedScale != null || hasVerifiedAxis)
-      ? { factor: get().autoScaleFactor, matches: get().anchorLog }   // preserve user truth
-      : computeScaleFactor(merged, STANDARD_ANCHORS, _baseMeshDimensions?.height ?? undefined);
+      ? { factor: get().autoScaleFactor, matches: get().anchorLog, rawDepthOverrides: new Map<string, number>() }
+      : computeScaleFactor(merged, STANDARD_ANCHORS, _baseMeshDimensions?.height ?? undefined, get().roomDimensions ?? undefined);
     const autoFactor  = scaleResult.factor;
     // Re-derive metricRatio in case new anchors nudged the average.
     const newMetricRatio = deriveMetricRatio(_rulerRatio, _baseMeshDimensions, verifiedYAxis, verifiedXAxis, verifiedZAxis) ?? metricRatio;
@@ -1985,7 +2063,14 @@ export const useAeroStore = create<AeroState>((set, get) => ({
       autoFactor, verifiedScaleFactor, newMetricRatio, _baseMeshDimensions,
       verifiedYAxis, verifiedZAxis, verifiedXAxis,
     );
-    const scaledMerged = reapplyAndValidate(merged, newGlobalScale);
+    // Apply geometric scaling, then Hybrid Validation, then Structural Stack Merge
+    // depth overrides.  The overrides replace the bed's scaled depth with
+    // maxStackRawDepth × gs.z so the true rectangular platform footprint is used.
+    const scaledMerged = applyRawDepthOverrides(
+      reapplyAndValidate(merged, newGlobalScale),
+      scaleResult.rawDepthOverrides,
+      newGlobalScale,
+    );
 
     console.log(
       `[AeroPilot] Scan complete — ${incoming.length} incoming, ${scaledMerged.length} total. ` +

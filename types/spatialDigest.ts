@@ -23,6 +23,12 @@ export interface WallClearance {
   remaining: number;
   /** True when remaining < 0.3 m. */
   atCapacity: boolean;
+  /**
+   * True when the raw remaining space was < 0.15 m — the 15 cm Wall Rule clamps
+   * this to 0.0 m and sets this flag so the AI and UI treat the furniture as
+   * flush with the wall rather than reporting a meaningless sub-threshold gap.
+   */
+  isTouchingWall?: boolean;
   /** Human-readable label. */
   label: string;
 }
@@ -80,4 +86,10 @@ export interface SpatialDigest {
   objectGaps:     GapEntry[];
   wallClearances: WallClearance[];
   pathBlockages:  PathBlockage[];
+  /**
+   * UIDs of objects whose digest-space centroid was snapped by Structural Healing
+   * (snapStackedObjects).  The store data is unchanged — these overrides exist
+   * only within the digest so the AI and dashboard see a physically coherent layout.
+   */
+  healedUids?: string[];
 }

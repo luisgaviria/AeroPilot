@@ -3,7 +3,25 @@
 import { useState, useRef } from "react";
 import { useAeroStore } from "@/store/useAeroStore";
 import type { BoundaryPlanes } from "@/types/diagnostics";
+import type { SpatialManifest } from "@/utils/diagnostics";
 import { fmtLen, fmtArea } from "@/utils/units";
+
+// ── Sandbox helpers ──────────────────────────────────────────────────────────
+
+interface SandboxMeta {
+  filename:    string;
+  exportedAt:  string;
+  fingerprint: string;
+}
+
+function parseSandboxFingerprint(manifest: SpatialManifest): string {
+  const r = manifest.room;
+  return (
+    `${r.width.toFixed(1)}×${r.length.toFixed(1)}×${r.height.toFixed(1)} m` +
+    ` · ${manifest.objects.length} obj` +
+    ` · scale ${manifest.scale.effective.toFixed(4)}×`
+  );
+}
 
 // ── Shared primitives ────────────────────────────────────────────────────────
 
@@ -157,7 +175,12 @@ export function DiagnosticDashboard() {
   const [lenInput,    setLenInput]   = useState("");
   const [widInput,    setWidInput]   = useState("");
   const [scaleInput,  setScaleInput] = useState("");
-  const [nameSynced, setNameSynced] = useState(false);
+  const [nameSynced,  setNameSynced] = useState(false);
+  const [sandboxMeta,   setSandboxMeta]   = useState<SandboxMeta | null>(null);
+  const [sandboxErr,    setSandboxErr]    = useState<string | null>(null);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [expandedUid,   setExpandedUid]   = useState<string | null>(null);
+  const fileInputRef   = useRef<HTMLInputElement | null>(null);
   const nameTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const roomDimensions        = useAeroStore((s) => s.roomDimensions);
@@ -184,6 +207,8 @@ export function DiagnosticDashboard() {
   const vectorSynced          = useAeroStore((s) => s._vectorSynced);
   const lockedScale           = useAeroStore((s) => s._lockedScale);
   const setManualScale        = useAeroStore((s) => s.setManualScale);
+  const loadSandboxManifest   = useAeroStore((s) => s.loadSandboxManifest);
+  const spatialDigest         = useAeroStore((s) => s.spatialDigest);
 
   const defaultName = `Space-Scan-${new Date().toISOString().slice(0, 10)}-…`;
   const [nameInput, setNameInput] = useState(currentRoomName ?? "");
@@ -196,6 +221,35 @@ export function DiagnosticDashboard() {
     if (nameTimeoutRef.current) clearTimeout(nameTimeoutRef.current);
     setNameSynced(true);
     nameTimeoutRef.current = setTimeout(() => setNameSynced(false), 3000);
+  }
+
+  // ── Spatial Sandbox file handler ──────────────────────────────────────────
+  function handleSandboxFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setSandboxErr(null);
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const manifest = JSON.parse(reader.result as string) as SpatialManifest;
+        if (manifest.schema !== "vista-spatial-manifest/v1") {
+          setSandboxErr("Not a valid AeroPilot manifest (wrong schema).");
+          return;
+        }
+        loadSandboxManifest(manifest);
+        setSandboxMeta({
+          filename:    file.name,
+          exportedAt:  manifest.exportedAt,
+          fingerprint: parseSandboxFingerprint(manifest),
+        });
+      } catch {
+        setSandboxErr("Failed to parse JSON — ensure the file is a valid AeroPilot export.");
+      }
+    };
+    reader.readAsText(file);
+    // Reset the input so the same file can be reloaded if needed
+    e.target.value = "";
   }
 
   const diag = spatialDiagnostics;
@@ -253,6 +307,15 @@ export function DiagnosticDashboard() {
     });
   }
 
+  // Architectural Artifacts — oversized openings excluded by the Anomaly Filter.
+  const archArtifacts = anchorLog.filter((m) => m.isArchitecturalArtifact);
+  for (const artifact of archArtifacts) {
+    gaps.push({
+      severity: "warn",
+      text: `Architectural Artifact: "${artifact.objectName}" exceeded plausibility bounds — excluded from scale calculation. Geometry is retained but not calibrated.`,
+    });
+  }
+
   // Hybrid Validation — per-object scale conflicts from the 70/30 pass.
   const scaleConflicts = detectedObjects.filter((o) => o.scaleValidation === "scale-conflict");
   for (const obj of scaleConflicts) {
@@ -268,6 +331,27 @@ export function DiagnosticDashboard() {
     gaps.push({
       severity: "ok",
       text: `${highConfCount} object${highConfCount > 1 ? "s" : ""} ✓✓ passed Hybrid Validation (geometry + AI agree within 15%).`,
+    });
+  }
+
+  // Structural Healing — centroid snapping applied in digest
+  const healedUids = spatialDigest?.healedUids ?? [];
+  if (healedUids.length > 0) {
+    const healedNames = healedUids
+      .map((uid) => detectedObjects.find((o) => o.uid === uid)?.name ?? uid)
+      .join(", ");
+    gaps.push({
+      severity: "ok",
+      text: `Structural Healing applied: centroid drift corrected for ${healedNames} (digest-only — store unchanged).`,
+    });
+  }
+
+  // 15 cm Wall Rule — touching-wall clamps in digest
+  const touchingWalls = (spatialDigest?.wallClearances ?? []).filter((w) => w.isTouchingWall);
+  for (const wc of touchingWalls) {
+    gaps.push({
+      severity: "ok",
+      text: `${wc.wall.charAt(0).toUpperCase() + wc.wall.slice(1)} wall: furniture flush (≤ 15 cm gap clamped to 0 in digest).`,
     });
   }
 
@@ -322,7 +406,7 @@ export function DiagnosticDashboard() {
       : "border-red-500/40 text-red-300";
 
   return (
-    <div className="flex flex-col items-start gap-2">
+    <div className="flex w-full max-w-4xl flex-col items-start gap-2">
       {/* ── Toggle button ── */}
       <button
         onClick={() => setOpen((v) => !v)}
@@ -348,9 +432,9 @@ export function DiagnosticDashboard() {
 
       {/* ── Dashboard panel ── */}
       {open && (
-        <div className="w-[26rem] rounded-2xl border border-white/12 bg-black/82 shadow-2xl shadow-black/60 backdrop-blur-md">
-          {/* Header */}
-          <div className="border-b border-white/10 px-5 py-3">
+        <div className="w-full max-h-[calc(100vh-2rem)] overflow-y-auto rounded-2xl border border-white/12 bg-black/82 shadow-2xl shadow-black/60 backdrop-blur-md">
+          {/* Header — sticky so it stays visible while scrolling through objects */}
+          <div className="sticky top-0 z-10 rounded-t-2xl border-b border-white/10 bg-black/82 px-3 py-3 backdrop-blur-md sm:px-5">
             <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-widest text-white/35">
               Spatial Diagnostic Dashboard
             </p>
@@ -460,7 +544,7 @@ export function DiagnosticDashboard() {
           </div>
 
           {/* ── Data Gap Report ── */}
-          <div className="border-b border-white/10 px-5 py-3">
+          <div className="border-b border-white/10 px-3 py-3 sm:px-5">
             <p className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-white/30">
               Data Gap Report
             </p>
@@ -471,8 +555,200 @@ export function DiagnosticDashboard() {
             </ul>
           </div>
 
+          {/* ── Object Inspector ── */}
+          <div className="border-b border-white/10 px-3 py-3 sm:px-5">
+            <button
+              className="flex w-full items-center justify-between"
+              onClick={() => setInspectorOpen((v) => !v)}
+            >
+              <p className="text-[10px] font-semibold uppercase tracking-widest text-white/30">
+                Object Inspector
+                <span className="ml-1.5 font-normal text-white/20">({detectedObjects.length})</span>
+              </p>
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 20 20"
+                fill="currentColor"
+                className={`h-3 w-3 text-white/25 transition-transform ${inspectorOpen ? "rotate-180" : ""}`}
+              >
+                <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clipRule="evenodd" />
+              </svg>
+            </button>
+
+            {inspectorOpen && detectedObjects.length === 0 && (
+              <p className="mt-2 text-[10px] text-white/25">No objects detected yet.</p>
+            )}
+
+            {inspectorOpen && detectedObjects.length > 0 && (
+              <div className="mt-2 space-y-1">
+                {detectedObjects.map((obj) => {
+                  const anchor    = anchorLog.find((m) => m.uid === obj.uid);
+                  const isExpanded = expandedUid === obj.uid;
+                  const raw       = obj.rawMeshDimensions;
+                  const scaled    = obj.dimensions;
+
+                  return (
+                    <div key={obj.uid} className="rounded-lg border border-white/8 bg-black/20">
+                      {/* Row header — click to expand; min-h satisfies 44 px touch target */}
+                      <button
+                        className="flex min-h-[44px] w-full items-center gap-2 px-3 py-2 text-left"
+                        onClick={() => setExpandedUid(isExpanded ? null : obj.uid)}
+                      >
+                        <span className="min-w-0 flex-1 truncate text-[11px] font-medium text-white/75">
+                          {obj.name}
+                        </span>
+                        {healedUids.includes(obj.uid) && (
+                          <span className="shrink-0 rounded bg-sky-500/20 px-1 py-0.5 text-[8px] font-semibold uppercase tracking-wide text-sky-300">
+                            Healed
+                          </span>
+                        )}
+                        {anchor?.isArchitecturalArtifact && (
+                          <span className="shrink-0 rounded bg-amber-500/20 px-1 py-0.5 text-[8px] font-semibold uppercase tracking-wide text-amber-400">
+                            Artifact
+                          </span>
+                        )}
+                        {anchor && (
+                          <span className={`shrink-0 text-[9px] ${anchor.included ? "text-emerald-400/60" : "text-white/25"}`}>
+                            {anchor.included ? "included" : "excluded"}
+                          </span>
+                        )}
+                        <svg
+                          xmlns="http://www.w3.org/2000/svg"
+                          viewBox="0 0 20 20"
+                          fill="currentColor"
+                          className={`h-2.5 w-2.5 shrink-0 text-white/20 transition-transform ${isExpanded ? "rotate-180" : ""}`}
+                        >
+                          <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clipRule="evenodd" />
+                        </svg>
+                      </button>
+
+                      {/* Expanded detail panel */}
+                      {isExpanded && (
+                        <div className="space-y-3 border-t border-white/8 px-3 py-2.5">
+
+                          {/* Raw vs Scaled dimensions */}
+                          {raw && scaled ? (
+                            <div>
+                              <p className="mb-1.5 text-[9px] font-semibold uppercase tracking-widest text-white/25">
+                                Dimensions
+                              </p>
+
+                              {/* Mobile stacked layout (< 640 px) */}
+                              <div className="space-y-1.5 sm:hidden">
+                                {(
+                                  [
+                                    { label: "Width",  r: raw.width,  s: scaled.width  },
+                                    { label: "Depth",  r: raw.depth,  s: scaled.depth  },
+                                    { label: "Height", r: raw.height, s: scaled.height },
+                                  ] as const
+                                ).map(({ label, r, s }) => (
+                                  <div key={label} className="flex items-center justify-between">
+                                    <span className="text-[9px] text-white/40">{label}</span>
+                                    <span className="font-mono text-[9px]">
+                                      <span className="text-white/50">{r.toFixed(4)}</span>
+                                      <span className="mx-1 text-white/20">→</span>
+                                      <span className="text-emerald-300/80">{fmtLen(s)}</span>
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+
+                              {/* Desktop 3-column grid (≥ 640 px) */}
+                              <div className="hidden sm:grid sm:grid-cols-3 sm:gap-x-2 sm:gap-y-0.5">
+                                <div />
+                                <p className="text-center text-[9px] text-white/30">Raw mesh</p>
+                                <p className="text-center text-[9px] text-white/30">Scaled</p>
+
+                                <p className="text-[9px] text-white/40">Width</p>
+                                <p className="text-center font-mono text-[9px] text-white/50">{raw.width.toFixed(4)}</p>
+                                <p className="text-center font-mono text-[9px] text-emerald-300/80">{fmtLen(scaled.width)}</p>
+
+                                <p className="text-[9px] text-white/40">Depth</p>
+                                <p className="text-center font-mono text-[9px] text-white/50">{raw.depth.toFixed(4)}</p>
+                                <p className="text-center font-mono text-[9px] text-emerald-300/80">{fmtLen(scaled.depth)}</p>
+
+                                <p className="text-[9px] text-white/40">Height</p>
+                                <p className="text-center font-mono text-[9px] text-white/50">{raw.height.toFixed(4)}</p>
+                                <p className="text-center font-mono text-[9px] text-emerald-300/80">{fmtLen(scaled.height)}</p>
+                              </div>
+                            </div>
+                          ) : (
+                            <p className="text-[9px] text-white/25">Raw mesh dimensions not captured.</p>
+                          )}
+
+                          {/* Scale anchor attribution */}
+                          {anchor && (
+                            <div>
+                              <p className="mb-1.5 text-[9px] font-semibold uppercase tracking-widest text-white/25">
+                                Scale Anchor
+                              </p>
+                              <div className="space-y-0.5">
+                                <div className="flex justify-between">
+                                  <span className="text-[9px] text-white/35">Standard ({anchor.dimension})</span>
+                                  <span className="font-mono text-[9px] text-white/60">{fmtLen(anchor.standardValue)}</span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span className="text-[9px] text-white/35">Measured</span>
+                                  <span className="font-mono text-[9px] text-white/60">{anchor.measuredValue.toFixed(4)}</span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span className="text-[9px] text-white/35">Suggested factor</span>
+                                  <span className="font-mono text-[9px] text-white/60">{anchor.suggestedFactor.toFixed(4)}×</span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span className="text-[9px] text-white/35">Weight (class × conf)</span>
+                                  <span className="font-mono text-[9px] text-white/60">
+                                    {anchor.classWeight} × {anchor.detectionConf.toFixed(2)} = {anchor.finalWeight.toFixed(3)}
+                                  </span>
+                                </div>
+                                {anchor.depthMode && (
+                                  <div className="flex justify-between">
+                                    <span className="text-[9px] text-white/35">Depth mode</span>
+                                    <span className="font-mono text-[9px] text-sky-300/70">{anchor.depthMode}</span>
+                                  </div>
+                                )}
+                                {anchor.stackMaxRawDepth != null && (
+                                  <div className="flex justify-between">
+                                    <span className="text-[9px] text-white/35">Stack depth override</span>
+                                    <span className="font-mono text-[9px] text-amber-300/70">
+                                      {anchor.stackMaxRawDepth.toFixed(4)} → {fmtLen(anchor.stackMaxRawDepth * globalScale.z)}
+                                    </span>
+                                  </div>
+                                )}
+                                {anchor.isArchitecturalArtifact && (
+                                  <p className="mt-1 text-[9px] leading-snug text-amber-400/80">
+                                    Exceeded plausibility bounds — excluded from global scale.
+                                  </p>
+                                )}
+                              </div>
+                            </div>
+                          )}
+
+                          {healedUids.includes(obj.uid) && (
+                            <div>
+                              <p className="mb-1.5 text-[9px] font-semibold uppercase tracking-widest text-white/25">
+                                Structural Healing
+                              </p>
+                              <p className="text-[9px] leading-snug text-sky-300/80">
+                                Centroid snapped to average with stack partner (digest-only). Store position unchanged.
+                              </p>
+                            </div>
+                          )}
+
+                          {!anchor && (
+                            <p className="text-[9px] text-white/25">Not a scale anchor — no calibration contribution.</p>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
           {/* ── Manual Data Injection ── */}
-          <div className="border-b border-white/10 px-5 py-4">
+          <div className="border-b border-white/10 px-3 py-4 sm:px-5">
             <p className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-white/30">
               Manual Data Injection
             </p>
@@ -606,8 +882,73 @@ export function DiagnosticDashboard() {
             </div>
           </div>
 
+          {/* ── Spatial Sandbox ── */}
+          <div className="border-b border-white/10 px-3 py-4 sm:px-5">
+            <p className="mb-2.5 text-[10px] font-semibold uppercase tracking-widest text-white/30">
+              Spatial Sandbox
+            </p>
+
+            {/* Hidden file input */}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json"
+              className="hidden"
+              onChange={handleSandboxFile}
+            />
+
+            {/* Load Scene button */}
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="flex w-full items-center justify-center gap-2 rounded-xl border border-sky-500/30 bg-sky-500/10 py-2.5 text-[11px] font-medium text-sky-300 transition-colors hover:bg-sky-500/20"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-3.5 w-3.5">
+                <path fillRule="evenodd" d="M15.621 4.379a3 3 0 00-4.242 0l-7 7a3 3 0 004.241 4.243h.001l.497-.5a.75.75 0 011.064 1.057l-.498.501-.002.002a4.5 4.5 0 01-6.364-6.364l7-7a4.5 4.5 0 016.368 6.36l-3.455 3.553A2.625 2.625 0 119.52 9.52l3.45-3.451a.75.75 0 111.061 1.06l-3.45 3.451a1.125 1.125 0 001.587 1.595l3.454-3.553a3 3 0 000-4.243z" clipRule="evenodd" />
+              </svg>
+              Load Scene (.json)
+            </button>
+
+            {/* Parse error */}
+            {sandboxErr && (
+              <p className="mt-2 text-[10px] leading-snug text-red-400">{sandboxErr}</p>
+            )}
+
+            {/* Source Metadata — shown once a file is loaded */}
+            {sandboxMeta && (
+              <div className="mt-3 rounded-lg border border-sky-500/20 bg-sky-500/8 px-3 py-2.5 space-y-1.5">
+                <p className="text-[9px] font-semibold uppercase tracking-widest text-sky-400/70">
+                  Source Metadata
+                </p>
+                <div className="flex items-start gap-2">
+                  <span className="w-16 shrink-0 text-[9px] text-white/30">File</span>
+                  <span className="min-w-0 break-all text-[10px] font-medium text-white/75">
+                    {sandboxMeta.filename}
+                  </span>
+                </div>
+                <div className="flex items-start gap-2">
+                  <span className="w-16 shrink-0 text-[9px] text-white/30">Exported</span>
+                  <span className="text-[10px] text-white/60">
+                    {new Date(sandboxMeta.exportedAt).toLocaleString()}
+                  </span>
+                </div>
+                <div className="flex items-start gap-2">
+                  <span className="w-16 shrink-0 text-[9px] text-white/30">Fingerprint</span>
+                  <span className="font-mono text-[9px] text-sky-300/80">
+                    {sandboxMeta.fingerprint}
+                  </span>
+                </div>
+                <button
+                  onClick={() => { setSandboxMeta(null); resetForNewScan(); setNameInput(""); }}
+                  className="mt-1 text-[9px] text-white/25 transition-colors hover:text-rose-300"
+                >
+                  Eject sandbox ✕
+                </button>
+              </div>
+            )}
+          </div>
+
           {/* ── Export + New Scan ── */}
-          <div className="flex flex-col gap-2 px-5 py-3">
+          <div className="flex flex-col gap-2 px-3 py-3 sm:px-5">
             <button
               onClick={exportSpatialManifest}
               disabled={!roomDimensions}
@@ -625,7 +966,7 @@ export function DiagnosticDashboard() {
               Export Spatial Manifest
             </button>
             <button
-              onClick={() => { resetForNewScan(); setNameInput(""); setOpen(false); }}
+              onClick={() => { resetForNewScan(); setSandboxMeta(null); setNameInput(""); setOpen(false); }}
               className="flex w-full items-center justify-center gap-2 rounded-xl border border-rose-500/30 bg-rose-500/8 py-2.5 text-[11px] font-medium text-rose-300 transition-colors hover:bg-rose-500/15"
             >
               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-3.5 w-3.5">
