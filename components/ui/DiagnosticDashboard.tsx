@@ -5,6 +5,7 @@ import { useAeroStore } from "@/store/useAeroStore";
 import type { BoundaryPlanes } from "@/types/diagnostics";
 import type { SpatialManifest } from "@/utils/diagnostics";
 import { fmtLen, fmtArea } from "@/utils/units";
+import type { ZoneType } from "@/types/spatialDigest";
 
 // ── Sandbox helpers ──────────────────────────────────────────────────────────
 
@@ -167,19 +168,48 @@ function InjectionRow({
   );
 }
 
+// ── Zone helpers ─────────────────────────────────────────────────────────────
+
+function zoneDotColor(type: ZoneType): string {
+  switch (type) {
+    case "bedroom":        return "bg-violet-400";
+    case "kitchen":        return "bg-amber-400";
+    case "living":         return "bg-sky-400";
+    case "living_bedroom": return "bg-teal-400";
+    case "hallway":        return "bg-white/40";
+    default:               return "bg-white/20";
+  }
+}
+
+function zoneBorderColor(type: ZoneType): string {
+  switch (type) {
+    case "bedroom":        return "border-violet-500/25 bg-violet-500/8";
+    case "kitchen":        return "border-amber-500/25 bg-amber-500/8";
+    case "living":         return "border-sky-500/25 bg-sky-500/8";
+    case "living_bedroom": return "border-teal-500/25 bg-teal-500/8";
+    case "hallway":        return "border-white/15 bg-white/4";
+    default:               return "border-white/10 bg-black/10";
+  }
+}
+
 // ── Main dashboard ───────────────────────────────────────────────────────────
 
 export function DiagnosticDashboard() {
-  const [open,        setOpen]       = useState(false);
-  const [ceilInput,   setCeilInput]  = useState("");
-  const [lenInput,    setLenInput]   = useState("");
-  const [widInput,    setWidInput]   = useState("");
-  const [scaleInput,  setScaleInput] = useState("");
+  const [open,             setOpen]            = useState(false);
+  const [ceilInput,        setCeilInput]       = useState("");
+  const [lenInput,         setLenInput]        = useState("");
+  const [widInput,         setWidInput]        = useState("");
+  const [scaleInput,       setScaleInput]      = useState("");
+  const [masterCeilInput,  setMasterCeilInput] = useState("");
+  // Zone calibration — per-zone width/length inputs keyed by zone label
+  const [zoneWidthInputs,  setZoneWidthInputs]  = useState<Record<string, string>>({});
+  const [zoneLengthInputs, setZoneLengthInputs] = useState<Record<string, string>>({});
   const [nameSynced,  setNameSynced] = useState(false);
   const [sandboxMeta,   setSandboxMeta]   = useState<SandboxMeta | null>(null);
   const [sandboxErr,    setSandboxErr]    = useState<string | null>(null);
-  const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [expandedUid,   setExpandedUid]   = useState<string | null>(null);
+  const [inspectorOpen, setInspectorOpen]   = useState(false);
+  const [expandedUid,   setExpandedUid]     = useState<string | null>(null);
+  const [expandedSnap,  setExpandedSnap]    = useState<number | null>(null);
   const fileInputRef   = useRef<HTMLInputElement | null>(null);
   const nameTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -207,8 +237,18 @@ export function DiagnosticDashboard() {
   const vectorSynced          = useAeroStore((s) => s._vectorSynced);
   const lockedScale           = useAeroStore((s) => s._lockedScale);
   const setManualScale        = useAeroStore((s) => s.setManualScale);
-  const loadSandboxManifest   = useAeroStore((s) => s.loadSandboxManifest);
-  const spatialDigest         = useAeroStore((s) => s.spatialDigest);
+  const masterCeilingHeight   = useAeroStore((s) => s.masterCeilingHeight);
+  const setMasterCeilingHeight = useAeroStore((s) => s.setMasterCeilingHeight);
+  const baseMeshDimensions    = useAeroStore((s) => s._baseMeshDimensions);
+  const loadSandboxManifest    = useAeroStore((s) => s.loadSandboxManifest);
+  const spatialDigest          = useAeroStore((s) => s.spatialDigest);
+  const zoneCalibrations       = useAeroStore((s) => s.zoneCalibrations);
+  const setZoneCalibration     = useAeroStore((s) => s.setZoneCalibration);
+  const clearZoneCalibration   = useAeroStore((s) => s.clearZoneCalibration);
+  const scannedZones           = useAeroStore((s) => s.scannedZones);
+  const masterScaleFactor      = useAeroStore((s) => s.masterScaleFactor);
+  const scanSnapshots          = useAeroStore((s) => s.scanSnapshots);
+  const pendingRefinement      = useAeroStore((s) => s.pendingRefinement);
 
   const defaultName = `Space-Scan-${new Date().toISOString().slice(0, 10)}-…`;
   const [nameInput, setNameInput] = useState(currentRoomName ?? "");
@@ -555,6 +595,359 @@ export function DiagnosticDashboard() {
             </ul>
           </div>
 
+          {/* ── Gemini Zone Map ── */}
+          {scannedZones.length > 0 && (
+            <div className="border-b border-white/10 px-3 py-3 sm:px-5">
+              <p className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-white/30">
+                Gemini Zone Map
+                <span className="ml-1.5 font-normal text-white/20">
+                  ({scannedZones.length} zone{scannedZones.length !== 1 ? "s" : ""})
+                </span>
+                {masterScaleFactor != null && (
+                  <span className="ml-2 rounded bg-emerald-500/20 px-1.5 py-0.5 text-[8px] font-semibold uppercase tracking-wide text-emerald-300">
+                    {masterScaleFactor.toFixed(3)}× master scale
+                  </span>
+                )}
+              </p>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                {scannedZones.map((zone) => {
+                  const sf    = masterScaleFactor ?? 1;
+                  const wm    = (zone.xMax - zone.xMin) * sf;
+                  const lm    = (zone.zMax - zone.zMin) * sf;
+                  const aream = wm * lm;
+                  return (
+                    <div
+                      key={zone.id}
+                      className="rounded-lg border border-white/10 bg-black/25 px-3 py-2.5"
+                    >
+                      <p className="truncate text-[11px] font-semibold text-white/80">{zone.label}</p>
+                      <div className="mt-1 space-y-0.5">
+                        <div className="flex justify-between">
+                          <span className="text-[9px] text-white/35">Width</span>
+                          <span className="font-mono text-[9px] text-emerald-300/80">{fmtLen(wm)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-[9px] text-white/35">Length</span>
+                          <span className="font-mono text-[9px] text-emerald-300/80">{fmtLen(lm)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-[9px] text-white/35">Area</span>
+                          <span className="font-mono text-[9px] text-white/45">{fmtArea(aream)}</span>
+                        </div>
+                        {masterScaleFactor == null && (
+                          <p className="text-[8px] text-amber-300/50">Raw Gemini coords — scan to apply scale</p>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* ── Zone Map + Per-Zone Calibration ── */}
+          {spatialDigest?.zoneMap && spatialDigest.zoneMap.zones.length > 0 && (
+            <div className="border-b border-white/10 px-3 py-3 sm:px-5">
+              <p className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-white/30">
+                Zone Map
+                <span className="ml-1.5 font-normal text-white/20">
+                  ({spatialDigest.zoneMap.zones.length} zone{spatialDigest.zoneMap.zones.length !== 1 ? "s" : ""})
+                </span>
+              </p>
+              <div className="space-y-2">
+                {spatialDigest.zoneMap.zones.map((zone) => {
+                  const wInput = zoneWidthInputs[zone.label]  ?? "";
+                  const lInput = zoneLengthInputs[zone.label] ?? "";
+                  const isLocked = zone.isDimensionLocked;
+
+                  function commitZoneDims() {
+                    const w = parseFloat(wInput);
+                    const l = parseFloat(lInput);
+                    const widthM  = Number.isFinite(w) && w > 0 ? w : null;
+                    const lengthM = Number.isFinite(l) && l > 0 ? l : null;
+                    if (widthM != null || lengthM != null) {
+                      setZoneCalibration(zone.label, widthM, lengthM);
+                    }
+                  }
+
+                  return (
+                    <div
+                      key={zone.id}
+                      className={`rounded-lg border px-3 py-2.5 ${zoneBorderColor(zone.type)}`}
+                    >
+                      {/* Zone header row */}
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${zoneDotColor(zone.type)}`} />
+                          <p className="truncate text-[11px] font-semibold text-white/80">{zone.label}</p>
+                          {zone.isTransitionPortal && (
+                            <span className="shrink-0 rounded bg-violet-500/20 px-1 py-0.5 text-[8px] font-semibold uppercase tracking-wide text-violet-300">
+                              Portal
+                            </span>
+                          )}
+                          {isLocked && (
+                            <span className="shrink-0 rounded bg-emerald-500/20 px-1 py-0.5 text-[8px] font-semibold uppercase tracking-wide text-emerald-300">
+                              Calibrated
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex shrink-0 items-center gap-2">
+                          <p className="font-mono text-[10px] text-white/40">{zone.areaSqm} m²</p>
+                          {isLocked && (
+                            <button
+                              onClick={() => {
+                                clearZoneCalibration(zone.label);
+                                setZoneWidthInputs((p) => { const n = { ...p }; delete n[zone.label]; return n; });
+                                setZoneLengthInputs((p) => { const n = { ...p }; delete n[zone.label]; return n; });
+                              }}
+                              title="Clear zone calibration"
+                              className="rounded px-1.5 py-0.5 text-[9px] text-white/25 transition-colors hover:bg-white/10 hover:text-rose-300"
+                            >
+                              ✕
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Wall clearances + object count */}
+                      <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5">
+                        <p className="text-[9px] text-white/30">
+                          {zone.objectUids.length} object{zone.objectUids.length !== 1 ? "s" : ""}
+                        </p>
+                        {zone.verifiedWidthM != null && (
+                          <p className="text-[9px] text-emerald-300/70">
+                            W: {zone.verifiedWidthM.toFixed(2)} m ✓
+                          </p>
+                        )}
+                        {zone.verifiedLengthM != null && (
+                          <p className="text-[9px] text-emerald-300/70">
+                            L: {zone.verifiedLengthM.toFixed(2)} m ✓
+                          </p>
+                        )}
+                        {zone.unobstructedFloorAreaM2 != null && (
+                          <p className="text-[9px] text-white/25">
+                            {zone.unobstructedFloorAreaM2} m² clear
+                          </p>
+                        )}
+                        {zone.kitchenWidthM != null && (
+                          <p className="text-[9px] text-amber-300/60">
+                            Kitchen width: {zone.kitchenWidthM.toFixed(2)} m
+                          </p>
+                        )}
+                        {zone.wallClearances.map((wc) => (
+                          <p key={wc.wall} className={`text-[9px] ${wc.isTouchingWall ? "text-amber-300/60" : wc.atCapacity ? "text-amber-300/50" : "text-white/25"}`}>
+                            {wc.wall[0].toUpperCase()}: {wc.isTouchingWall ? "flush" : `${wc.remaining.toFixed(2)} m`}
+                          </p>
+                        ))}
+                      </div>
+
+                      {/* Zone calibration inputs */}
+                      <div className="mt-2.5 border-t border-white/8 pt-2">
+                        <p className="mb-1.5 text-[9px] font-semibold uppercase tracking-widest text-white/25">
+                          Tape-Measure Override
+                        </p>
+                        <div className="flex items-center gap-2">
+                          <div className="flex flex-1 items-center gap-1">
+                            <input
+                              type="number"
+                              step="0.01"
+                              min="0.1"
+                              max="50"
+                              value={wInput}
+                              onChange={(e) => setZoneWidthInputs((p) => ({ ...p, [zone.label]: e.target.value }))}
+                              onKeyDown={(e) => { if (e.key === "Enter") commitZoneDims(); }}
+                              placeholder={zone.verifiedWidthM != null ? zone.verifiedWidthM.toFixed(2) : "W m"}
+                              className="w-full rounded border border-white/12 bg-black/40 px-2 py-1 text-[10px] text-white outline-none placeholder-white/20 focus:border-emerald-400/50"
+                            />
+                            <span className="shrink-0 text-[9px] text-white/25">×</span>
+                            <input
+                              type="number"
+                              step="0.01"
+                              min="0.1"
+                              max="50"
+                              value={lInput}
+                              onChange={(e) => setZoneLengthInputs((p) => ({ ...p, [zone.label]: e.target.value }))}
+                              onKeyDown={(e) => { if (e.key === "Enter") commitZoneDims(); }}
+                              placeholder={zone.verifiedLengthM != null ? zone.verifiedLengthM.toFixed(2) : "L m"}
+                              className="w-full rounded border border-white/12 bg-black/40 px-2 py-1 text-[10px] text-white outline-none placeholder-white/20 focus:border-emerald-400/50"
+                            />
+                          </div>
+                          <button
+                            onClick={commitZoneDims}
+                            disabled={!wInput.trim() && !lInput.trim()}
+                            className="shrink-0 rounded border border-emerald-500/30 bg-emerald-500/12 px-2.5 py-1 text-[10px] font-medium text-emerald-300 transition-colors hover:bg-emerald-500/22 disabled:cursor-not-allowed disabled:opacity-40"
+                          >
+                            Apply
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+                {spatialDigest.zoneMap.transitionPortals.length > 0 && (
+                  <p className="text-[9px] text-violet-300/50">
+                    {spatialDigest.zoneMap.transitionPortals.length} transition portal{spatialDigest.zoneMap.transitionPortals.length !== 1 ? "s" : ""} detected
+                    {" ("}
+                    {spatialDigest.zoneMap.transitionPortals
+                      .map((p) => `${p.widthM.toFixed(2)} m ${p.axis}-gap`)
+                      .join(", ")}
+                    {")"}
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ── Visual Debugger — Scan Snapshots ── */}
+          {scanSnapshots.length > 0 && (
+            <div className="border-b border-white/10 px-3 py-3 sm:px-5">
+              <div className="mb-2 flex items-center justify-between">
+                <p className="text-[10px] font-semibold uppercase tracking-widest text-white/30">
+                  Visual Debugger
+                  <span className="ml-1.5 font-normal text-white/20">
+                    ({scanSnapshots.length} snapshot{scanSnapshots.length !== 1 ? "s" : ""})
+                  </span>
+                </p>
+                {pendingRefinement && (
+                  <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-amber-300">
+                    Refinement pending…
+                  </span>
+                )}
+              </div>
+              {/* Thumbnail strip */}
+              <div className="flex gap-1.5 overflow-x-auto pb-1">
+                {scanSnapshots.map((snap, idx) => (
+                  <button
+                    key={idx}
+                    onClick={() => setExpandedSnap(expandedSnap === idx ? null : idx)}
+                    className={`relative shrink-0 overflow-hidden rounded border transition-colors ${
+                      expandedSnap === idx
+                        ? "border-sky-400/60"
+                        : snap.label === "refinement"
+                        ? "border-amber-500/40"
+                        : "border-white/15"
+                    }`}
+                    style={{ width: 72, height: 54 }}
+                  >
+                    <img
+                      src={snap.dataUrl}
+                      alt={snap.label}
+                      className="h-full w-full object-cover"
+                    />
+                    <span className="absolute bottom-0 left-0 right-0 bg-black/60 py-0.5 text-center text-[7px] font-medium text-white/70">
+                      {snap.label}
+                    </span>
+                    {snap.anchorObjects && (
+                      <span className="absolute right-0.5 top-0.5 h-2 w-2 rounded-full bg-red-400" />
+                    )}
+                  </button>
+                ))}
+              </div>
+
+              {/* Expanded snapshot with bounding-box + anchor-pin overlay */}
+              {expandedSnap !== null && scanSnapshots[expandedSnap] && (() => {
+                const snap = scanSnapshots[expandedSnap];
+                const DISP_W = 320;
+                const DISP_H = Math.round((snap.height / snap.width) * DISP_W);
+                const sx = DISP_W / snap.width;
+                const sy = DISP_H / snap.height;
+
+                return (
+                  <div className="mt-2 overflow-hidden rounded-lg border border-white/15 bg-black/40">
+                    {/* Image with SVG overlay */}
+                    <div
+                      className="relative mx-auto"
+                      style={{ width: DISP_W, height: DISP_H }}
+                    >
+                      <img
+                        src={snap.dataUrl}
+                        alt={snap.label}
+                        className="absolute inset-0 h-full w-full object-fill"
+                        draggable={false}
+                      />
+                      <svg
+                        className="absolute inset-0"
+                        width={DISP_W}
+                        height={DISP_H}
+                        viewBox={`0 0 ${DISP_W} ${DISP_H}`}
+                      >
+                        {snap.objects.map((obj, oi) => {
+                          const hasBox = obj.xLeft && obj.xRight && obj.yTop && obj.yBottom
+                            && obj.xLeft > 0 && obj.xRight > 0;
+                          const isAnchor = snap.anchorObjects?.includes(obj.name);
+                          const cx = obj.x * sx;
+                          const cy = obj.y * sy;
+
+                          return (
+                            <g key={oi}>
+                              {hasBox && (
+                                <rect
+                                  x={obj.xLeft! * sx}
+                                  y={obj.yTop! * sy}
+                                  width={(obj.xRight! - obj.xLeft!) * sx}
+                                  height={(obj.yBottom! - obj.yTop!) * sy}
+                                  fill="none"
+                                  stroke={isAnchor ? "#ef4444" : "#60a5fa"}
+                                  strokeWidth={isAnchor ? 2 : 1}
+                                  strokeDasharray={isAnchor ? undefined : "3 2"}
+                                  opacity={0.85}
+                                />
+                              )}
+                              {/* Center dot */}
+                              <circle
+                                cx={cx}
+                                cy={cy}
+                                r={isAnchor ? 5 : 3}
+                                fill={isAnchor ? "#ef4444" : "#60a5fa"}
+                                opacity={0.9}
+                              />
+                              {/* Label */}
+                              <text
+                                x={cx + 6}
+                                y={cy - 4}
+                                fontSize={7}
+                                fill={isAnchor ? "#fca5a5" : "#93c5fd"}
+                                dominantBaseline="middle"
+                              >
+                                {obj.name}
+                              </text>
+                            </g>
+                          );
+                        })}
+                      </svg>
+                    </div>
+                    {/* Metadata row */}
+                    <div className="flex flex-wrap gap-x-4 gap-y-0.5 px-3 py-2">
+                      <p className="text-[9px] text-white/40">
+                        <span className="font-medium text-white/60">{snap.label}</span>
+                        {" — "}{snap.objects.length} object{snap.objects.length !== 1 ? "s" : ""}
+                        {" · "}{snap.width}×{snap.height}px
+                      </p>
+                      {snap.anchorObjects && (
+                        <p className="text-[9px] text-red-300/70">
+                          Anchors: {snap.anchorObjects.join(" ↔ ")}
+                        </p>
+                      )}
+                    </div>
+                    {/* Object list */}
+                    <div className="border-t border-white/8 px-3 pb-2 pt-1.5">
+                      <div className="flex flex-wrap gap-x-3 gap-y-0.5">
+                        {snap.objects.map((obj, oi) => (
+                          <span
+                            key={oi}
+                            className={`text-[9px] ${snap.anchorObjects?.includes(obj.name) ? "font-semibold text-red-300" : "text-white/35"}`}
+                          >
+                            {obj.name} ({(obj.confidence * 100).toFixed(0)}%)
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
           {/* ── Object Inspector ── */}
           <div className="border-b border-white/10 px-3 py-3 sm:px-5">
             <button
@@ -579,13 +972,43 @@ export function DiagnosticDashboard() {
               <p className="mt-2 text-[10px] text-white/25">No objects detected yet.</p>
             )}
 
-            {inspectorOpen && detectedObjects.length > 0 && (
-              <div className="mt-2 space-y-1">
-                {detectedObjects.map((obj) => {
-                  const anchor    = anchorLog.find((m) => m.uid === obj.uid);
-                  const isExpanded = expandedUid === obj.uid;
-                  const raw       = obj.rawMeshDimensions;
-                  const scaled    = obj.dimensions;
+            {inspectorOpen && detectedObjects.length > 0 && (() => {
+              // Build uid → zone lookup from the digest
+              const uidToZone = new Map<string, { id: string; label: string; type: ZoneType }>();
+              if (spatialDigest?.zoneMap) {
+                for (const z of spatialDigest.zoneMap.zones) {
+                  for (const uid of z.objectUids) {
+                    uidToZone.set(uid, { id: z.id, label: z.label, type: z.type });
+                  }
+                }
+              }
+
+              // Group objects by zone; unzoned objects go at the end
+              const byZone = new Map<string, typeof detectedObjects>();
+              const unzoned: typeof detectedObjects = [];
+              for (const obj of detectedObjects) {
+                const z = uidToZone.get(obj.uid);
+                if (z) {
+                  if (!byZone.has(z.id)) byZone.set(z.id, []);
+                  byZone.get(z.id)!.push(obj);
+                } else {
+                  unzoned.push(obj);
+                }
+              }
+
+              const zones = spatialDigest?.zoneMap?.zones ?? [];
+              // Ordered zone groups (follow digest zone order), then unzoned
+              const groups: Array<{ zoneId: string; label: string; type: ZoneType; objects: typeof detectedObjects }> = [];
+              for (const z of zones) {
+                const objs = byZone.get(z.id);
+                if (objs && objs.length > 0) groups.push({ zoneId: z.id, label: z.label, type: z.type, objects: objs });
+              }
+
+              const renderObjectRow = (obj: typeof detectedObjects[0]) => {
+                const anchor     = anchorLog.find((m) => m.uid === obj.uid);
+                const isExpanded = expandedUid === obj.uid;
+                const raw        = obj.rawMeshDimensions;
+                const scaled     = obj.dimensions;
 
                   return (
                     <div key={obj.uid} className="rounded-lg border border-white/8 bg-black/20">
@@ -742,9 +1165,45 @@ export function DiagnosticDashboard() {
                       )}
                     </div>
                   );
-                })}
-              </div>
-            )}
+              };  // ← end renderObjectRow
+
+              return (
+                <div className="mt-2 space-y-2">
+                  {/* ── Zoned groups ── */}
+                  {groups.map((group) => (
+                    <div key={group.zoneId}>
+                      {/* Zone group header */}
+                      <div className={`mb-1 flex items-center gap-1.5 rounded-md border px-2 py-1 ${zoneBorderColor(group.type)}`}>
+                        <span className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${zoneDotColor(group.type)}`} />
+                        <p className="text-[9px] font-semibold uppercase tracking-widest text-white/50">
+                          {group.label}
+                        </p>
+                        <span className="ml-auto text-[9px] text-white/20">
+                          {group.objects.length}
+                        </span>
+                      </div>
+                      <div className="space-y-1">
+                        {group.objects.map(renderObjectRow)}
+                      </div>
+                    </div>
+                  ))}
+                  {/* ── Unzoned objects (no primary-object cluster nearby) ── */}
+                  {unzoned.length > 0 && (
+                    <div>
+                      <div className="mb-1 flex items-center gap-1.5 rounded-md border border-white/8 bg-black/10 px-2 py-1">
+                        <p className="text-[9px] font-semibold uppercase tracking-widest text-white/25">
+                          Unzoned
+                        </p>
+                        <span className="ml-auto text-[9px] text-white/20">{unzoned.length}</span>
+                      </div>
+                      <div className="space-y-1">
+                        {unzoned.map(renderObjectRow)}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           </div>
 
           {/* ── Manual Data Injection ── */}
@@ -753,6 +1212,81 @@ export function DiagnosticDashboard() {
               Manual Data Injection
             </p>
             <div className="space-y-3">
+
+              {/* ── Master Ceiling Height ── highest-priority calibration input ── */}
+              <div className={`rounded-lg border px-3 py-2.5 ${
+                masterCeilingHeight != null
+                  ? "border-violet-500/50 bg-violet-500/10"
+                  : "border-white/15 bg-white/4"
+              }`}>
+                <div className="mb-1.5 flex items-center justify-between">
+                  <div>
+                    <p className="flex items-center gap-1.5 text-[11px] font-semibold text-white/80">
+                      Master Ceiling Height
+                      <span className="rounded bg-violet-500/25 px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-violet-300">
+                        Priority&nbsp;1
+                      </span>
+                    </p>
+                    <p className="text-[9px] leading-snug text-white/30">
+                      {masterCeilingHeight != null
+                        ? (() => {
+                            const rawH = baseMeshDimensions?.height ?? 0;
+                            const factor = rawH > 0 ? masterCeilingHeight / rawH : null;
+                            return `Locked at ${masterCeilingHeight.toFixed(3)} m${factor != null ? ` · factor ${factor.toFixed(4)}×` : ""}`;
+                          })()
+                        : baseMeshDimensions
+                          ? `Raw mesh ceiling: ${baseMeshDimensions.height.toFixed(3)} m — enter real-world height`
+                          : "Load a model to enable master calibration"}
+                    </p>
+                  </div>
+                  {masterCeilingHeight != null && (
+                    <button
+                      onClick={() => { setMasterCeilingHeight(null); setMasterCeilInput(""); }}
+                      title="Clear master ceiling — revert to auto-scale"
+                      className="rounded-lg border border-white/15 bg-black/40 px-2.5 py-1 text-[10px] text-white/50 transition-colors hover:border-rose-500/40 hover:text-rose-300"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="1.5"
+                    max="12"
+                    value={masterCeilInput}
+                    onChange={(e) => setMasterCeilInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        const n = parseFloat(masterCeilInput);
+                        if (Number.isFinite(n) && n > 0) { setMasterCeilingHeight(n); setMasterCeilInput(""); }
+                      }
+                    }}
+                    placeholder={
+                      masterCeilingHeight != null
+                        ? masterCeilingHeight.toFixed(3)
+                        : baseMeshDimensions
+                          ? baseMeshDimensions.height.toFixed(3)
+                          : "e.g. 2.6"
+                    }
+                    disabled={!baseMeshDimensions}
+                    className="min-w-0 flex-1 rounded border border-white/15 bg-black/40 px-2 py-1 text-[11px] font-mono text-white outline-none placeholder-white/20 focus:border-violet-400/60 disabled:opacity-30"
+                  />
+                  <button
+                    onClick={() => {
+                      const n = parseFloat(masterCeilInput);
+                      if (Number.isFinite(n) && n > 0) { setMasterCeilingHeight(n); setMasterCeilInput(""); }
+                    }}
+                    disabled={!baseMeshDimensions || !masterCeilInput.trim() || !Number.isFinite(parseFloat(masterCeilInput)) || parseFloat(masterCeilInput) <= 0}
+                    title="Apply master ceiling — snap all room dimensions"
+                    className="rounded-lg border border-violet-500/40 bg-violet-500/15 px-3 py-1 text-[10px] font-medium text-violet-300 transition-colors hover:bg-violet-500/25 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    Apply
+                  </button>
+                </div>
+              </div>
+
               <InjectionRow
                 label={`Verified ${axisLabel("y")}`}
                 unit="m"

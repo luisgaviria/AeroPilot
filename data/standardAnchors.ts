@@ -69,6 +69,34 @@ export interface StandardAnchor {
    * Not set for object types where width is genuinely unbounded (e.g. long counters).
    */
   sanityMax?:  number;
+  /**
+   * Minimum credible raw height (metres) before calibration.
+   * If a detected object's rawDimensions.height is below this threshold it was
+   * scanned as a "pancake" — a flat mesh that would produce a wildly large
+   * scale factor.  The Pancake Guard in computeScaleFactor excludes such objects
+   * from calibration entirely.
+   */
+  sanityMinHeight?: number;
+  /**
+   * When true, this fixture is a fixed architectural appliance used by the
+   * ZoneEngine to identify functional rooms in empty units (e.g. kitchen via
+   * refrigerator / stove / sink / cabinet cluster).
+   */
+  isArchitecturalAnchor?: boolean;
+  /**
+   * Standard horizontal footprint (floor plan) for OBB estimation.
+   *
+   * When the scan produces a suspiciously square Axis-Aligned Bounding Box for
+   * a known non-square object, the Diagonal-Invariant OBB Estimator uses this
+   * aspect ratio to recover the true width and depth:
+   *
+   *   W² + D² = W_aabb² + D_aabb²   (diagonal preserved under rotation)
+   *   W / D   = widthM / depthM     (known standard aspect ratio)
+   *
+   * Leave unset for objects with naturally square footprints, openings, or
+   * objects where footprint variation is too high to anchor (e.g. counters).
+   */
+  standardFootprint?: { widthM: number; depthM: number };
 }
 
 export const STANDARD_ANCHORS: StandardAnchor[] = [
@@ -92,16 +120,22 @@ export const STANDARD_ANCHORS: StandardAnchor[] = [
   { pattern: /\bbathr?o?o?m?\s*sink\b|\bbasin\b|\bpedestal\s+sink\b/i, dimension: "height", standard: 0.86, tier: "fixture", classWeight: 0.4, sanityMax: 2.0 },
 
   // ── Furniture ── HIGH classWeight — predictable, rarely custom ───────────────
-  { pattern: /\bsofa\b|\bcouch\b|\bsectional\b/i,               dimension: "height", standard: 0.86, tier: "furniture",    classWeight: 1.0, sanityMax: 4.0  },
+  { pattern: /\bsofa\b|\bcouch\b|\bsectional\b/i,               dimension: "height", standard: 0.86, tier: "furniture",    classWeight: 1.0, sanityMax: 4.0,  sanityMinHeight: 0.45, standardFootprint: { widthM: 2.10, depthM: 0.90 } },
   // Width-based; standard defaults to Queen (most common). computeScaleFactor
   // overrides this via the BED_LADDER nearest-neighbour heuristic at runtime.
-  { pattern: /\bbed\b/i,                                        dimension: "width",  standard: 1.50, tier: "furniture",    classWeight: 1.0, sanityMax: 2.2  },
-  { pattern: /\bdining\s+table\b/i,                             dimension: "height", standard: 0.76, tier: "furniture",    classWeight: 1.0, sanityMax: 3.0  },
+  // sanityMinHeight guards against flat "pancake" bed scans even though this anchor uses width.
+  { pattern: /\bbed\b/i,                                        dimension: "width",  standard: 1.50, tier: "furniture",    classWeight: 1.0, sanityMax: 2.2,  sanityMinHeight: 0.30, standardFootprint: { widthM: 1.50, depthM: 2.00 } },
+  { pattern: /\bdining\s+table\b/i,                             dimension: "height", standard: 0.76, tier: "furniture",    classWeight: 1.0, sanityMax: 3.0,  standardFootprint: { widthM: 1.50, depthM: 0.90 } },
+  { pattern: /\brefrigerator\b|\bfridge\b/i,                    dimension: "height", standard: 1.70, tier: "fixture",      classWeight: 0.4, sanityMax: 2.5,  sanityMinHeight: 0.45, standardFootprint: { widthM: 0.70, depthM: 0.70 }, isArchitecturalAnchor: true },
+  // ── Architectural Anchors — fixed kitchen fixtures for empty-unit zone mapping ─
+  { pattern: /\bstove\b|\brange\b/i,                            dimension: "height", standard: 0.91, tier: "fixture",      classWeight: 0.4, sanityMax: 1.5,  isArchitecturalAnchor: true },
+  { pattern: /\bsink\b/i,                                       dimension: "height", standard: 0.91, tier: "fixture",      classWeight: 0.4, sanityMax: 1.5,  isArchitecturalAnchor: true },
+  { pattern: /\bcabinet\b/i,                                    dimension: "height", standard: 0.91, tier: "fixture",      classWeight: 0.4, sanityMax: 2.4,  isArchitecturalAnchor: true },
 
   // ── Furniture ── MEDIUM classWeight ─────────────────────────────────────────
   { pattern: /\bchair\b|\bdining\s+chair\b|\barmchair\b/i,      dimension: "height", standard: 0.46, tier: "furniture",    classWeight: 0.4, sanityMax: 1.5  },
   { pattern: /\bdesk\b|\bwriting\s+table\b/i,                   dimension: "height", standard: 0.76, tier: "furniture",    classWeight: 0.4, sanityMax: 3.0  },
-  { pattern: /\bwardrobe\b|\barmoire\b|\bcloset\b/i,             dimension: "height", standard: 2.10, tier: "furniture",    classWeight: 0.4, sanityMax: 4.0  },
+  { pattern: /\bwardrobe\b|\barmoire\b|\bcloset\b/i,             dimension: "height", standard: 2.10, tier: "furniture",    classWeight: 0.4, sanityMax: 4.0,  standardFootprint: { widthM: 1.20, depthM: 0.58 } },
   { pattern: /\bbookshelf\b|\bbookcase\b/i,                     dimension: "height", standard: 1.80, tier: "furniture",    classWeight: 0.4, sanityMax: 4.0  },
   { pattern: /\bdresser\b|\bchest\s+of\s+drawers\b/i,           dimension: "height", standard: 1.20, tier: "furniture",    classWeight: 0.4, sanityMax: 2.5  },
   { pattern: /\bcoffee\s+table\b|\bcenter\s+table\b|\bcentre\s+table\b/i, dimension: "height", standard: 0.42, tier: "furniture", classWeight: 0.4, sanityMax: 1.5 },

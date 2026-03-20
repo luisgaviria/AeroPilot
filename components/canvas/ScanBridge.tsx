@@ -23,10 +23,11 @@ type BatchEntry = {
 
 export function ScanBridge() {
   const { gl, camera, scene } = useThree();
-  const pendingScan         = useAeroStore((s) => s.pendingScan);
-  const isDeepScanning      = useAeroStore((s) => s.isDeepScanning);
-  const pendingIsolationUIDs = useAeroStore((s) => s.pendingIsolationUIDs);
-  const batchRef             = useRef<BatchEntry[]>([]);
+  const pendingScan            = useAeroStore((s) => s.pendingScan);
+  const isDeepScanning         = useAeroStore((s) => s.isDeepScanning);
+  const pendingIsolationUIDs   = useAeroStore((s) => s.pendingIsolationUIDs);
+  const pendingRefinement      = useAeroStore((s) => s.pendingRefinement);
+  const batchRef              = useRef<BatchEntry[]>([]);
 
   useEffect(() => {
     if (!pendingScan) return;
@@ -193,11 +194,68 @@ export function ScanBridge() {
          * Calls Vision API with a pre-captured snapshot, then raycasts results.
          * Retries once (after 1 s) on 500 / 503 / 504 errors.
          */
+        type PassResult = { hits: IncomingDetection[]; zones: import("@/types/spatialDigest").GeminiZone[] };
+
+        /**
+         * Maps a cropped-image pixel back to original-frame pixel space.
+         * When a snapshot is a zoomed crop of the original frame, Gemini returns
+         * coords relative to the crop; this descriptor lets us remap them back for
+         * correct raycasting against the original camera.
+         */
+        interface CropRegion {
+          sx: number;   // crop start X in original image (pixels)
+          sy: number;   // crop start Y in original image (pixels)
+          sw: number;   // crop source width  (pixels)
+          sh: number;   // crop source height (pixels)
+          origW: number; // original frame width
+          origH: number; // original frame height
+        }
+
+        /**
+         * Crops a snapshot around (centerX, centerY), zooming `fraction` of the
+         * frame into the full canvas dimensions.  Returns null on canvas failure.
+         */
+        async function cropThresholdFrame(
+          origSnap:  ReturnType<typeof captureSnapshotFromCamera>,
+          centerX:   number,
+          centerY:   number,
+          fraction:  number,
+        ): Promise<{ croppedSnap: ReturnType<typeof captureSnapshotFromCamera>; cropRegion: CropRegion } | null> {
+          return new Promise((resolve) => {
+            const img = new Image();
+            img.onload = () => {
+              const cropW = Math.round(img.width  * fraction);
+              const cropH = Math.round(img.height * fraction);
+              const sx    = Math.max(0, Math.min(img.width  - cropW, Math.round(centerX - cropW / 2)));
+              const sy    = Math.max(0, Math.min(img.height - cropH, Math.round(centerY - cropH / 2)));
+
+              const canvas = document.createElement("canvas");
+              canvas.width  = origSnap.width;
+              canvas.height = origSnap.height;
+              const ctx = canvas.getContext("2d");
+              if (!ctx) { resolve(null); return; }
+
+              // Draw crop region scaled to full canvas size
+              ctx.drawImage(img, sx, sy, cropW, cropH, 0, 0, origSnap.width, origSnap.height);
+
+              const dataUrl = canvas.toDataURL("image/jpeg", 0.88);
+              const base64  = dataUrl.split(",")[1];
+              resolve({
+                croppedSnap: { base64, mimeType: "image/jpeg" as const, width: origSnap.width, height: origSnap.height },
+                cropRegion:  { sx, sy, sw: cropW, sh: cropH, origW: origSnap.width, origH: origSnap.height },
+              });
+            };
+            img.onerror = () => resolve(null);
+            img.src = `data:${origSnap.mimeType};base64,${origSnap.base64}`;
+          });
+        }
+
         async function processApiAndRaycast(
           snap: ReturnType<typeof captureSnapshotFromCamera>,
           cam: Camera,
           label: string,
-        ): Promise<IncomingDetection[]> {
+          cropRegion?: CropRegion,
+        ): Promise<PassResult> {
           console.log(
             `[ScanBridge][${label}] snapshot ${snap.width}×${snap.height} ` +
             (gl.domElement.clientWidth !== snap.width || gl.domElement.clientHeight !== snap.height
@@ -205,12 +263,21 @@ export function ScanBridge() {
           );
 
           const RETRYABLE = new Set([500, 503, 504]);
+          const {
+            anchorRoomType, anchorWidth, masterCeilingHeight, verifiedZAxis,
+            walkthroughActive,
+          } = useAeroStore.getState();
           const body = JSON.stringify({
             mode: "discover",
             image: snap.base64,
             mimeType: snap.mimeType,
-            canvasWidth:  snap.width,
-            canvasHeight: snap.height,
+            canvasWidth:       snap.width,
+            canvasHeight:      snap.height,
+            anchorRoomType:    anchorRoomType      ?? undefined,
+            anchorWidth:       anchorWidth         ?? undefined,
+            anchorLength:      verifiedZAxis       ?? undefined,
+            masterCeiling:     masterCeilingHeight ?? undefined,
+            walkthroughMode:   walkthroughActive   ?? false,
           });
           const fetchOpts: RequestInit = {
             method: "POST",
@@ -232,21 +299,54 @@ export function ScanBridge() {
 
           if (!res.ok) {
             const errText = await res.text().catch(() => "(unreadable)");
-            console.error(
-              `[ScanBridge][${label}] Vision API error HTTP ${res.status}: ${errText}`
-            );
-            return [];
+            if (res.status === 422) {
+              console.error(
+                `[Spatial Fragmentation][${label}] Zone data missing — store fallback will activate. ` +
+                `Server: ${errText}`
+              );
+            } else {
+              console.error(
+                `[ScanBridge][${label}] Vision API error HTTP ${res.status}: ${errText}`
+              );
+            }
+            return { hits: [], zones: [] };
           }
 
-          const { objects } = (await res.json()) as { objects: VisionObject[] };
+          const apiResponse = (await res.json()) as { objects: VisionObject[]; zones?: import("@/types/spatialDigest").GeminiZone[]; isPreCalibrated?: boolean };
+          const { objects, zones: apiZones, isPreCalibrated: apiPreCal } = apiResponse;
+
+          // ── Visual Debugger: save snapshot + Gemini detections ───────────────
+          useAeroStore.getState().addScanSnapshot({
+            label:    label,
+            dataUrl:  `data:${snap.mimeType};base64,${snap.base64}`,
+            mimeType: snap.mimeType,
+            width:    snap.width,
+            height:   snap.height,
+            objects:  objects,
+          });
+
           console.log(
             `[ScanBridge][${label}] API returned ${objects.length} object(s):`,
             objects.map((o) => `${o.name}(${o.x},${o.y}) conf=${o.confidence?.toFixed(2) ?? "?"}`).join(" | ")
           );
+          if (apiZones && apiZones.length > 0) {
+            console.log(
+              `[ScanBridge][${label}] Zones (${apiZones.length}): `,
+              apiZones.map((z) =>
+                `[${z.label}: X ${z.xMin.toFixed(2)}–${z.xMax.toFixed(2)}m, ` +
+                `Z ${z.zMin.toFixed(2)}–${z.zMax.toFixed(2)}m ` +
+                `(${((z.xMax - z.xMin) * (z.zMax - z.zMin)).toFixed(1)}m²)]`
+              ).join("  |  ")
+            );
+          }
 
           const hits: IncomingDetection[] = [];
           for (const obj of objects) {
-            const pos3D = raycastPixelTo3D(obj.x, obj.y, snap.width, snap.height, cam, scene, obj.name, 2.0);
+            // When processing a cropped image, remap pixel coords back to
+            // original-frame space so the raycast uses the correct camera ray.
+            const rayX  = cropRegion ? cropRegion.sx + (obj.x / snap.width)  * cropRegion.sw : obj.x;
+            const rayY  = cropRegion ? cropRegion.sy + (obj.y / snap.height) * cropRegion.sh : obj.y;
+            const pos3D = raycastPixelTo3D(rayX, rayY, snap.width, snap.height, cam, scene, obj.name, 2.0);
             if (!pos3D) {
               console.warn(`[ScanBridge][${label}] ✗ "${obj.name}" at pixel(${obj.x},${obj.y}) — no 3D hit`);
               continue;
@@ -264,8 +364,11 @@ export function ScanBridge() {
             const position3D = measured?.center ?? raycastCenter;
 
             console.log(
-              `[ScanBridge][${label}] ✓ "${obj.name}" pixel(${obj.x},${obj.y}) → ` +
-              `3D(${pos3D.x.toFixed(2)}, ${pos3D.y.toFixed(2)}, ${pos3D.z.toFixed(2)})` +
+              `[ScanBridge][${label}] ✓ "${obj.name}" ` +
+              (cropRegion
+                ? `crop(${obj.x},${obj.y}) → frame(${Math.round(rayX)},${Math.round(rayY)})`
+                : `pixel(${obj.x},${obj.y})`) +
+              ` → 3D(${pos3D.x.toFixed(2)}, ${pos3D.y.toFixed(2)}, ${pos3D.z.toFixed(2)})` +
               (measured ? ` → cluster(${position3D.map((n) => n.toFixed(2)).join(", ")})` : "")
             );
             hits.push({
@@ -296,11 +399,11 @@ export function ScanBridge() {
               }, 5_000);
             }
           }
-          return hits;
+          return { hits, zones: apiZones ?? [] };
         }
 
         /** Full capture + API + raycast for a given camera. */
-        async function scanWithCamera(cam: Camera, label: string): Promise<IncomingDetection[]> {
+        async function scanWithCamera(cam: Camera, label: string): Promise<PassResult> {
           const snap = captureSnapshotFromCamera(gl, scene, cam, cssW, cssH);
           return processApiAndRaycast(snap, cam, label);
         }
@@ -327,6 +430,7 @@ export function ScanBridge() {
           const batch1 = batch.slice(0, BATCH_SIZE);
           const batch2 = batch.slice(BATCH_SIZE);
 
+          useAeroStore.getState().setSurveyPhase("resolving");
           console.log(
             `[ScanBridge] Firing deep-scan in 2 batches ` +
             `(${batch1.length} + ${batch2.length}) with ${INTRA_STAGGER} ms intra-stagger`
@@ -335,21 +439,21 @@ export function ScanBridge() {
           // Pause if the tab is hidden before we start firing.
           await waitForVisible();
 
-          const allPromises: Promise<IncomingDetection[]>[] = [];
+          const allPromises: Promise<PassResult>[] = [];
 
           // ── Batch 1 ───────────────────────────────────────────────────────
           for (let i = 0; i < batch1.length; i++) {
             const entry = batch1[i];
             const idx   = i;
             allPromises.push(
-              new Promise<IncomingDetection[]>((resolve) => {
+              new Promise<PassResult>((resolve) => {
                 setTimeout(async () => {
                   await waitForVisible();
                   try {
                     resolve(await processApiAndRaycast(entry.snap, entry.cam, `deep-${idx + 1}`));
                   } catch (err) {
                     console.error(`[ScanBridge] deep-${idx + 1} failed:`, err);
-                    resolve([]);
+                    resolve({ hits: [], zones: [] });
                   }
                 }, idx * INTRA_STAGGER);
               }),
@@ -366,14 +470,14 @@ export function ScanBridge() {
             const entry    = batch2[i];
             const globalIdx = BATCH_SIZE + i;
             allPromises.push(
-              new Promise<IncomingDetection[]>((resolve) => {
+              new Promise<PassResult>((resolve) => {
                 setTimeout(async () => {
                   await waitForVisible();
                   try {
                     resolve(await processApiAndRaycast(entry.snap, entry.cam, `deep-${globalIdx + 1}`));
                   } catch (err) {
                     console.error(`[ScanBridge] deep-${globalIdx + 1} failed:`, err);
-                    resolve([]);
+                    resolve({ hits: [], zones: [] });
                   }
                 }, i * INTRA_STAGGER);
               }),
@@ -381,19 +485,110 @@ export function ScanBridge() {
           }
 
           const settled = await Promise.allSettled(allPromises);
-          const allDetections = settled
-            .filter((r): r is PromiseFulfilledResult<IncomingDetection[]> => r.status === "fulfilled")
-            .flatMap((r) => r.value);
+          const allResults = settled
+            .filter((r): r is PromiseFulfilledResult<PassResult> => r.status === "fulfilled")
+            .map((r) => r.value);
+          const allDetections = allResults.flatMap((r) => r.hits);
+
+          // Merge zones from all passes: deduplicate by zone id, keep the first occurrence.
+          const seenZoneIds = new Set<string>();
+          const mergedZones = allResults
+            .flatMap((r) => r.zones)
+            .filter((z) => {
+              if (seenZoneIds.has(z.id)) return false;
+              seenZoneIds.add(z.id);
+              return true;
+            });
 
           console.log(
-            `[ScanBridge] Batch complete — ${allDetections.length} total detections from ${batch.length} passes`
+            `[ScanBridge] Batch complete — ${allDetections.length} total detections from ${batch.length} passes, ` +
+            `${mergedZones.length} unique zone(s) across all passes`
           );
-          resolveScan(allDetections);
+
+          // ── Virtual Waypoint Analysis ───────────────────────────────────────
+          // After the initial 360° batch resolves, find architectural transitions
+          // (doorways, openings) detected in any frame.  For each, crop the source
+          // frame around that threshold to create a "zoomed portal view" and fire
+          // a targeted API call.  This simulates the surveyor "walking" to and
+          // through each zone boundary.
+          {
+            const TRANSITION_PATTERN = /door(?:way)?|opening|archway|arch|entry|passage|corridor/i;
+
+            // Collect unique transition sources (one per doorway, deduped by proximity)
+            const vwpSources: Array<{ frameIdx: number; objName: string; px: number; py: number }> = [];
+            allResults.forEach((result, fi) => {
+              for (const h of result.hits) {
+                if (!TRANSITION_PATTERN.test(h.name)) continue;
+                const isDupe = vwpSources.some(
+                  (s) => s.frameIdx === fi &&
+                         Math.abs(s.px - h.pixelCoords.x) < 80 &&
+                         Math.abs(s.py - h.pixelCoords.y) < 80,
+                );
+                if (!isDupe && fi < batch.length) {
+                  vwpSources.push({ frameIdx: fi, objName: h.name, px: h.pixelCoords.x, py: h.pixelCoords.y });
+                }
+              }
+            });
+
+            if (vwpSources.length > 0) {
+              useAeroStore.getState().setSurveyPhase("virtual-waypoints");
+              console.log(
+                `[ScanBridge] Virtual Waypoints: ${vwpSources.length} threshold(s) found — ` +
+                vwpSources.map((s) => `"${s.objName}" frame${s.frameIdx + 1}`).join(", "),
+              );
+
+              const limited = vwpSources.slice(0, 3); // cap: 3 virtual waypoints max
+              const vwpResults = await Promise.all(
+                limited.map(async (vwp, i) => {
+                  await waitForVisible();
+                  const entry = batch[vwp.frameIdx];
+                  if (!entry) return { hits: [], zones: [] } as PassResult;
+                  try {
+                    const result = await cropThresholdFrame(entry.snap, vwp.px, vwp.py, 0.45);
+                    if (!result) return { hits: [], zones: [] } as PassResult;
+                    return processApiAndRaycast(
+                      result.croppedSnap,
+                      entry.cam,
+                      `vwp-${i + 1}:${vwp.objName}`,
+                      result.cropRegion,
+                    );
+                  } catch (err) {
+                    console.error(`[ScanBridge] VWP ${i + 1} failed:`, err);
+                    return { hits: [], zones: [] } as PassResult;
+                  }
+                }),
+              );
+
+              const vwpHits  = vwpResults.flatMap((r) => r.hits);
+              const vwpZones = vwpResults.flatMap((r) => r.zones);
+              console.log(
+                `[ScanBridge] Virtual Waypoints resolved — ` +
+                `${vwpHits.length} hit(s) added, ${vwpZones.length} zone(s) proposed`,
+              );
+              allDetections.push(...vwpHits);
+              // Merge new zones only — first occurrence per id wins
+              for (const vz of vwpZones) {
+                if (!seenZoneIds.has(vz.id)) { seenZoneIds.add(vz.id); mergedZones.push(vz); }
+              }
+            }
+          }
+
+          useAeroStore.getState().setSurveyPhase("resolving");
+          {
+            const s = useAeroStore.getState();
+            const batchPreCal = !!(s.anchorRoomType && s.anchorWidth && s.masterCeilingHeight);
+            resolveScan(allDetections, batchPreCal, mergedZones);
+          }
+          useAeroStore.getState().setSurveyPhase(null);
           // Auto-save only when detections were actually collected
           if (allDetections.length > 0) {
             useAeroStore.getState().saveCurrentRoom().catch((err) =>
               console.error("[ScanBridge] Auto-save (deep scan) failed:", err)
             );
+          }
+          // Clean up walkthrough state when the user drove the capture sequence manually
+          if (useAeroStore.getState().walkthroughActive) {
+            useAeroStore.getState().finalizeWalkthroughScan();
           }
         } else {
           // Single scan: two passes (normal + 2° jitter) — merge before resolving.
@@ -401,11 +596,25 @@ export function ScanBridge() {
             scanWithCamera(snapCamera, "pass1"),
             scanWithCamera(makeJitterCamera(snapCamera, 2), "pass2"),
           ]);
-          const detected = [...pass1, ...pass2];
+          const detected = [...pass1.hits, ...pass2.hits];
+
+          // Merge zones from both passes — deduplicate by id.
+          const seenSingle = new Set<string>();
+          const singleZones = [...pass1.zones, ...pass2.zones].filter((z) => {
+            if (seenSingle.has(z.id)) return false;
+            seenSingle.add(z.id);
+            return true;
+          });
+
           console.log(
-            `[ScanBridge] Jitter merge — pass1: ${pass1.length}, pass2: ${pass2.length}, total: ${detected.length}`
+            `[ScanBridge] Jitter merge — pass1: ${pass1.hits.length}, pass2: ${pass2.hits.length}, ` +
+            `total: ${detected.length}, zones: ${singleZones.length}`
           );
-          resolveScan(detected);
+          {
+            const s = useAeroStore.getState();
+            const singlePreCal = !!(s.anchorRoomType && s.anchorWidth && s.masterCeilingHeight);
+            resolveScan(detected, singlePreCal, singleZones);
+          }
           // Auto-save after every successful single scan
           useAeroStore.getState().saveCurrentRoom().catch((err) =>
             console.error("[ScanBridge] Auto-save (scan) failed:", err)
@@ -420,6 +629,112 @@ export function ScanBridge() {
 
     runScan();
   }, [pendingScan, gl, camera, scene, isDeepScanning]);
+
+  // ── Refinement Pass — re-interrogates the last snapshot when scale is implausible ──
+  useEffect(() => {
+    if (!pendingRefinement) return;
+
+    async function runRefinement() {
+      const {
+        scanSnapshots,
+        clearRefinement,
+        anchorRoomType,
+        anchorWidth,
+        masterCeilingHeight,
+        verifiedZAxis,
+        resolveScan: resolveRefinement,
+      } = useAeroStore.getState();
+
+      clearRefinement();
+
+      const lastSnap = scanSnapshots[scanSnapshots.length - 1];
+      if (!lastSnap) {
+        console.warn("[ScanBridge] Refinement triggered but no snapshot available.");
+        return;
+      }
+
+      console.log(
+        `[ScanBridge] Refinement Pass — re-examining "${lastSnap.label}" ` +
+        `(scale was ${pendingRefinement!.scaleFactor.toFixed(2)}×, expected 0.5–2.0×)`,
+      );
+
+      // Strip the data URL prefix to get raw base64
+      const base64 = lastSnap.dataUrl.includes(",")
+        ? lastSnap.dataUrl.split(",")[1]
+        : lastSnap.dataUrl;
+
+      try {
+        const body = JSON.stringify({
+          mode:              "discover",
+          image:             base64,
+          mimeType:          lastSnap.mimeType,
+          canvasWidth:       lastSnap.width,
+          canvasHeight:      lastSnap.height,
+          anchorRoomType:    anchorRoomType    ?? undefined,
+          anchorWidth:       anchorWidth       ?? undefined,
+          anchorLength:      verifiedZAxis     ?? undefined,
+          masterCeiling:     masterCeilingHeight ?? undefined,
+          refinementContext: pendingRefinement,
+        });
+
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        });
+
+        if (!res.ok) {
+          console.error(`[ScanBridge] Refinement API failed HTTP ${res.status}`);
+          return;
+        }
+
+        const data = (await res.json()) as {
+          objects: VisionObject[];
+          zones?: import("@/types/spatialDigest").GeminiZone[];
+          isPreCalibrated?: boolean;
+        };
+
+        // Save the refinement snapshot with its own label for the visual debugger
+        useAeroStore.getState().addScanSnapshot({
+          label:    "refinement",
+          dataUrl:  lastSnap.dataUrl,
+          mimeType: lastSnap.mimeType,
+          width:    lastSnap.width,
+          height:   lastSnap.height,
+          objects:  data.objects,
+        });
+
+        // Raycast the refined detections — use a simplified path (no 3D
+        // measurements here; this pass is purely for scale re-calibration)
+        const {
+          anchorRoomType: art,
+          anchorWidth:    aw,
+          masterCeilingHeight: mch,
+        } = useAeroStore.getState();
+        const refinementPreCal = !!(art && aw && mch);
+        resolveRefinement(
+          data.objects.map((o) => ({
+            name:        o.name,
+            position3D:  [0, 0, 0] as import("three").Vector3Tuple,
+            pixelCoords: { x: o.x, y: o.y },
+            confidence:  o.confidence,
+          })),
+          refinementPreCal,
+          data.zones ?? [],
+          true, // skipRefinement — prevents infinite loops
+        );
+
+        console.log(
+          `[ScanBridge] Refinement complete — ` +
+          `${data.objects.length} object(s), ${data.zones?.length ?? 0} zone(s)`,
+        );
+      } catch (err) {
+        console.error("[ScanBridge] Refinement pass failed:", err);
+      }
+    }
+
+    runRefinement();
+  }, [pendingRefinement]);
 
   // ── Voxel Isolation — targeted re-measurement for Sanity Guard triggers ────
   useEffect(() => {

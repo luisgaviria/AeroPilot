@@ -1,4 +1,17 @@
 /**
+ * Re-exported from utils/semanticScale so consumers can import from one place.
+ * Defined in semanticScale to keep geometric types co-located with the engine.
+ */
+export type {
+  PlausibilityTrial,
+  PlausibilityIssue,
+  PlausibilityAction,
+  ValidationResult,
+  SpatialHealthReport,
+  SpatialHealthReportEntry,
+} from "@/utils/semanticScale";
+
+/**
  * SpatialDigest — pre-computed spatial summary sent to the chat API.
  *
  * Built client-side from calibrated object dimensions after every scan or
@@ -77,6 +90,109 @@ export interface ObjectInventoryEntry {
    */
   map?:        { x: number; z: number; w: number; d: number };
   label:       string;
+  /** Zone this object was assigned to by the Hybrid Zoning System. */
+  zoneId?:     string;
+}
+
+// ─── Hybrid Zoning System types ───────────────────────────────────────────────
+
+/**
+ * A narrow corridor connecting two adjacent zones, identified when the gap
+ * between two zone bounding boxes falls in the 0.8–1.2 m range.
+ */
+export interface TransitionPortal {
+  /** IDs of the two zones on either side of this portal. */
+  between: [string, string];
+  /** Axis along which the gap runs (gap is perpendicular to travel direction). */
+  axis:    "x" | "z";
+  /** Measured corridor width in metres. */
+  widthM:  number;
+}
+
+export type ZoneType = "bedroom" | "living" | "kitchen" | "hallway" | "living_bedroom" | "unclassified";
+
+/**
+ * One detected spatial zone.  Zones are derived from object clustering
+ * (semantic) and optionally from geometric aperture analysis (hard split).
+ */
+export interface Zone {
+  /** Stable short identifier, e.g. "zone-a". */
+  id:                 string;
+  /** Human-readable label, e.g. "Living Room", "Kitchen", "Hallway". */
+  label:              string;
+  type:               ZoneType;
+  /** UIDs of every object (all tiers) assigned to this zone. */
+  objectUids:         string[];
+  /** Gross floor area of the zone AABB in m². */
+  areaSqm:            number;
+  /** Axis-aligned bounding box of the zone (objects + buffer). */
+  bounds:             { xMin: number; xMax: number; zMin: number; zMax: number };
+  /**
+   * True when this zone was identified as (or is adjacent to) a Transition
+   * Portal — a corridor identified by geometric aperture analysis.
+   */
+  isTransitionPortal?: boolean;
+  /**
+   * Unobstructed floor area in m² — zone AABB area minus the combined footprint
+   * of all primary-tier fixtures.  Reported for renters evaluating empty units.
+   */
+  unobstructedFloorAreaM2?: number;
+  /**
+   * Kitchen width in metres — distance from the front of the cabinet bank to the
+   * opposite room wall.  Present only on kitchen zones that contain a cabinet.
+   */
+  kitchenWidthM?: number;
+  /**
+   * Wall clearances computed using ONLY objects within this zone and only the
+   * room walls that are spatially adjacent to this zone's AABB.
+   * Used for localised proximity queries ("how much space on the living room
+   * north wall?") without cross-contamination from other zones.
+   */
+  wallClearances:     WallClearance[];
+  /**
+   * Tape-measured width (X-axis) supplied by the user for this zone specifically.
+   * When set, the engine applies a local X-axis correction to all objects in this
+   * zone inside the digest (digest-only — store positions are unchanged).
+   */
+  verifiedWidthM:     number | null;
+  /**
+   * Tape-measured length (Z-axis) supplied by the user for this zone specifically.
+   */
+  verifiedLengthM:    number | null;
+  /**
+   * True when at least one verified dimension has been applied to this zone,
+   * indicating that local calibration is active and overrides scan data.
+   */
+  isDimensionLocked:  boolean;
+}
+
+/**
+ * Per-zone manual calibration overrides keyed by zone label (e.g. "Kitchen").
+ * Used by buildSpatialDigest to apply local scale corrections digest-only.
+ */
+export type ZoneCalibrationMap = Record<string, { widthM: number | null; lengthM: number | null }>;
+
+/**
+ * Zone boundary as returned by the Gemini vision model.
+ * Coordinates are real-world metres with room origin (0, 0) at the near-left corner.
+ * X grows rightward, Z grows away from the viewer.
+ *
+ * Distinct from the computed `Zone` (which is built from object clustering).
+ * GeminiZone provides the architectural ground truth; Zone provides the
+ * occupancy-derived segmentation.
+ */
+export interface GeminiZone {
+  id:    string;
+  label: string;
+  xMin:  number;
+  xMax:  number;
+  zMin:  number;
+  zMax:  number;
+}
+
+export interface ZoneMap {
+  zones:              Zone[];
+  transitionPortals:  TransitionPortal[];
 }
 
 export interface SpatialDigest {
@@ -84,6 +200,7 @@ export interface SpatialDigest {
   inventory:      ObjectInventoryEntry[];
   /** Clearances between primary-tier objects only. */
   objectGaps:     GapEntry[];
+  /** Global wall clearances (full room, all objects). */
   wallClearances: WallClearance[];
   pathBlockages:  PathBlockage[];
   /**
@@ -92,4 +209,42 @@ export interface SpatialDigest {
    * only within the digest so the AI and dashboard see a physically coherent layout.
    */
   healedUids?: string[];
+  /**
+   * Hybrid zone segmentation — always present.
+   * When no primary-tier objects are detected, zones and transitionPortals are empty.
+   * Each zone has its own wall clearances so the AI can answer localised queries.
+   */
+  zoneMap: ZoneMap;
+  /**
+   * Full per-object, per-iteration trial log produced by the Recursive Validation
+   * Engine (runValidationLoop).  Present when ≥ 1 anchored object was evaluated.
+   * Each entry records the issue detected, correction applied, and resulting score
+   * so the AI and dashboard can surface convergence reasoning.
+   */
+  validationTrials?: import("@/utils/semanticScale").PlausibilityTrial[];
+  /**
+   * UIDs of objects flagged as Scan Artifacts after exhausting all validation
+   * iterations.  These objects retain their position in the zone map but their
+   * dimensions are excluded from objectGaps and wallClearances.
+   */
+  ghostArtifactUids?: string[];
+  /**
+   * Final Global Plausibility Score (0–100) after the validation loop converged.
+   * A score ≥ 90 means every anchored object's dimensions are within tolerance.
+   */
+  globalPlausibilityScore?: number;
+  /**
+   * Structured Spatial Health Report — generated for every digest.
+   * Documents every healing event (reason, before/after dims) without
+   * requiring manual log inspection.
+   */
+  spatialHealthReport?: import("@/utils/semanticScale").SpatialHealthReport;
+  /**
+   * True when this digest was produced with a user-verified anchor room.
+   * When true, globalScale is locked at 1.0× and all semantic healer passes
+   * (Hybrid Validation, runValidationLoop) are bypassed for this session.
+   * Object dimensions are treated as already-calibrated real-world values.
+   * False when operating in normal auto-calibration mode.
+   */
+  isPreCalibrated: boolean;
 }

@@ -6,6 +6,7 @@ import { Environment, Html, Line } from "@react-three/drei";
 import { useAeroStore } from "@/store/useAeroStore";
 import { DetectedObject } from "@/types/auto-discovery";
 import { Vector3Tuple } from "three";
+import * as THREE from "three";
 import { Model } from "./Model";
 import { CameraRig } from "./CameraRig";
 import { ScanBridge } from "./ScanBridge";
@@ -127,6 +128,131 @@ function RulerMarkers() {
   );
 }
 
+/**
+ * Glowing 3D navigation pin at the centre of each scanned room.
+ * Click to teleport the camera to that room and make it active.
+ */
+function RoomNavPins() {
+  const rooms          = useAeroStore((s) => s.rooms);
+  const activeRoomId   = useAeroStore((s) => s.activeRoomId);
+  const navigateToRoom = useAeroStore((s) => s.navigateToRoom);
+
+  if (rooms.length === 0) return null;
+
+  return (
+    <>
+      {rooms.map((room) => {
+        const isActive = room.id === activeRoomId;
+        const color    = isActive ? "#38bdf8" : "#818cf8";   // sky-400 : indigo-400
+        return (
+          <group key={room.id} position={[room.centerX, 0, room.centerZ]}>
+            {/* Glowing beacon cylinder */}
+            <mesh
+              position={[0, 0.06, 0]}
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                navigateToRoom(room.id);
+              }}
+            >
+              <cylinderGeometry args={[0.10, 0.10, 0.12, 16]} />
+              <meshStandardMaterial
+                color={color}
+                emissive={color}
+                emissiveIntensity={isActive ? 3 : 1.5}
+                toneMapped={false}
+              />
+            </mesh>
+
+            {/* Ambient point-light glow */}
+            <pointLight color={color} intensity={isActive ? 2 : 0.8} distance={2} />
+
+            {/* Room name label */}
+            <Html
+              position={[0, 0.35, 0]}
+              center
+              distanceFactor={5}
+              zIndexRange={[100, 100]}
+              wrapperClass="pointer-events-none"
+            >
+              <div
+                style={{ pointerEvents: "none" }}
+                className={`flex items-center gap-1 rounded-lg border px-2 py-1 text-[11px] font-semibold shadow-md backdrop-blur-sm whitespace-nowrap ${
+                  isActive
+                    ? "border-sky-400/50 bg-sky-500/20 text-sky-200"
+                    : "border-indigo-400/30 bg-black/60 text-indigo-200/80"
+                }`}
+              >
+                {room.name}
+                <span className="font-normal opacity-60">
+                  {room.widthM.toFixed(1)}×{room.lengthM.toFixed(1)}m
+                </span>
+              </div>
+            </Html>
+          </group>
+        );
+      })}
+    </>
+  );
+}
+
+/** Arrow directions for room snapping. */
+const SNAP_DIRS = [
+  { dir: "N" as const, rotation: [0, 0, Math.PI / 2]  as [number, number, number], offset: (l: number) => [0, 0, -(l / 2 + 0.4)]  as Vector3Tuple },
+  { dir: "S" as const, rotation: [0, 0, -Math.PI / 2] as [number, number, number], offset: (l: number) => [0, 0,  (l / 2 + 0.4)]  as Vector3Tuple },
+  { dir: "E" as const, rotation: [0, 0, -Math.PI]     as [number, number, number], offset: (w: number) => [ (w / 2 + 0.4), 0, 0]  as Vector3Tuple },
+  { dir: "W" as const, rotation: [0, 0, 0]            as [number, number, number], offset: (w: number) => [-(w / 2 + 0.4), 0, 0]  as Vector3Tuple },
+];
+
+/**
+ * 4 clickable directional arrows on the active room's bounding box.
+ * Clicking an arrow snaps the room face to the nearest adjacent room.
+ */
+function RoomSnapArrows() {
+  const rooms          = useAeroStore((s) => s.rooms);
+  const activeRoomId   = useAeroStore((s) => s.activeRoomId);
+  const snapActiveRoom = useAeroStore((s) => s.snapActiveRoom);
+
+  const active = rooms.find((r) => r.id === activeRoomId);
+  if (!active || rooms.length < 1) return null;
+
+  return (
+    <group position={[active.centerX, 0.08, active.centerZ]}>
+      {SNAP_DIRS.map(({ dir, rotation, offset }) => {
+        const pos = dir === "N" || dir === "S"
+          ? offset(active.lengthM)
+          : offset(active.widthM);
+        return (
+          <mesh
+            key={dir}
+            position={pos}
+            rotation={rotation as unknown as THREE.Euler}
+            onPointerDown={(e) => {
+              e.stopPropagation();
+              snapActiveRoom(dir);
+            }}
+          >
+            <coneGeometry args={[0.12, 0.28, 8]} />
+            <meshStandardMaterial
+              color="#f59e0b"
+              emissive="#f59e0b"
+              emissiveIntensity={2}
+              toneMapped={false}
+            />
+          </mesh>
+        );
+      })}
+
+      {/* AABB outline of the active room */}
+      <primitive
+        object={new THREE.LineSegments(
+          new THREE.EdgesGeometry(new THREE.BoxGeometry(active.widthM, 0.01, active.lengthM)),
+          new THREE.LineBasicMaterial({ color: "#f59e0b", opacity: 0.35, transparent: true }),
+        )}
+      />
+    </group>
+  );
+}
+
 /** Renders a persistent AR label for every detected object (hidden during cinematic tour). */
 function SpatialLabels() {
   const detectedObjects = useAeroStore((s) => s.detectedObjects);
@@ -172,6 +298,12 @@ export function Scene() {
 
       {/* Geometry diagnostics + floor-snap handler */}
       <DiagnosticsProbe />
+
+      {/* Room navigation pins — glowing beacons at room centres */}
+      <RoomNavPins />
+
+      {/* Room snap arrows — directional alignment controls for active room */}
+      <RoomSnapArrows />
 
       {/* Reference Ruler — invisible capture plane + marker spheres */}
       <RulerCapturePlane />

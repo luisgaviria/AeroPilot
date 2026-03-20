@@ -299,6 +299,21 @@ export function computeScaleFactor(
       if (!anchor.pattern.test(obj.name)) continue;
       const measured = obj.rawDimensions![anchor.dimension];
       if (!measured || measured <= 0) break; // degenerate measurement
+      // ── Pancake Guard ──────────────────────────────────────────────────────
+      // A "pancake" scan produces a near-flat mesh (very small raw height) that
+      // would divide into standard height and yield an absurdly large factor.
+      // Exclude the object entirely so it cannot corrupt the global scale.
+      if (
+        anchor.sanityMinHeight != null &&
+        (obj.rawDimensions!.height ?? 0) < anchor.sanityMinHeight
+      ) {
+        console.warn(
+          `[SemanticScale] ⚠ Pancake scan: "${obj.name}" ` +
+          `rawHeight=${(obj.rawDimensions!.height ?? 0).toFixed(3)}m < ` +
+          `sanityMinHeight=${anchor.sanityMinHeight}m — excluded from calibration.`,
+        );
+        break;
+      }
       const detectionConf = +(obj.confidence ?? 0).toFixed(4);
       const classWeight   = anchor.classWeight;
       const finalWeight   = +(classWeight * detectionConf).toFixed(4);
@@ -752,6 +767,740 @@ export function applyHybridValidation(
 
     return { ...obj, dimensions: blended, scaleValidation: "high-confidence" as const, scaleConflictMsg: undefined };
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Heal Height — post-scale correction for pancaked furniture anchors.
+ *
+ * When a Master Scale lock is active, objects that were scanned as near-flat
+ * ("pancake") meshes end up with scaled heights well below their real-world
+ * standard even after the uniform factor is applied (e.g. sofa 0.3m raw ×
+ * 1.8× = 0.54m instead of the expected 0.86m).
+ *
+ * For every object that:
+ *   1. Has a matching anchor with `sanityMinHeight` AND `dimension === "height"`,
+ *   2. Was originally scanned below the anchor's sanityMinHeight (confirmed pancake),
+ *   3. Has a scaled height still below the anchor's standard,
+ * → snap the displayed height to `anchor.standard`.
+ *
+ * This never runs when lockedScale is null (auto-scale mode).
+ */
+export function applyHealHeight(
+  objects:     DetectedObject[],
+  lockedScale: number | null,
+  anchors:     StandardAnchor[] = STANDARD_ANCHORS,
+): DetectedObject[] {
+  if (lockedScale == null) return objects;
+  return objects.map((obj) => {
+    if (obj.isUserVerified)                        return obj;
+    if (!obj.dimensions || !obj.rawMeshDimensions) return obj;
+    const anchor = anchors.find(
+      (a) => a.pattern.test(obj.name) && a.sanityMinHeight != null && a.dimension === "height",
+    );
+    if (!anchor) return obj;
+    // Only heal objects whose raw scan was genuinely pancaked (height < sanityMinHeight).
+    if ((obj.rawMeshDimensions.height ?? 0) >= anchor.sanityMinHeight!) return obj;
+    if (obj.dimensions.height >= anchor.standard)  return obj; // already at or above standard
+    console.log(
+      `[SemanticScale] Heal Height: "${obj.name}" ` +
+      `scaledH=${obj.dimensions.height.toFixed(3)}m → ${anchor.standard}m ` +
+      `(rawH=${obj.rawMeshDimensions.height.toFixed(3)}m < sanityMinH=${anchor.sanityMinHeight}m, ` +
+      `lock=${lockedScale.toFixed(4)}×).`,
+    );
+    return { ...obj, dimensions: { ...obj.dimensions, height: anchor.standard } };
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Coordinate-Agnostic Validation Engine ─────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Maximum iterations the Recursive Validation Loop will run before declaring
+ * any object still below GHOST_PLAUSIBILITY_MIN a Scan Artifact.
+ */
+const VALIDATION_MAX_ITER     = 3;
+/** Fractional deviation threshold above which the AABB aspect ratio is considered
+ *  "suspiciously rotated" relative to the anchor's standard footprint ratio. */
+const OBB_ROTATION_THRESHOLD  = 0.30;
+/** Per-object plausibility score (0–100) below which the loop retries. */
+const PASS_SCORE_MIN          = 80;
+/** After maxIter, objects below this score are flagged as Ghost Artifacts. */
+const GHOST_PLAUSIBILITY_MIN  = 30;
+/** Loop exits early when the Global Plausibility Score reaches this value. */
+const GLOBAL_TARGET_SCORE     = 90.0;
+
+// ── Types ────────────────────────────────────────────────────────────────────
+
+export type PlausibilityIssue =
+  | "scan-hallucination"   // dimension is physically impossible (w > sanityMax, etc.)
+  | "obb-rotation"         // AABB aspect ratio deviates from anchor standard footprint
+  | "pancake"              // raw height below sanityMinHeight; scaled height still too low
+  | "oversized"            // dimension exceeds physical sanityMax
+  | "sole-type-undersized" // only instance of its type in scene; width below standard
+  | "none";                // object is already plausible — no correction needed
+
+export type PlausibilityAction =
+  | "obb-reproject"    // diagonal-invariant OBB width+depth recovery
+  | "heal-height"      // snap height to anchor.standard (confirmed pancake)
+  | "anchor-clamp"     // uniform rescale so anchor-axis == anchor.standard
+  | "ghost-reject"     // permanently flagged as Scan Artifact after maxIter
+  | "room-fit-pass"    // object is large but footprint fits the room floor plan — allowed
+  | "semantic-expand"  // sole-type object expanded to standard (or user-verified) footprint
+  | "pass";            // no action taken (score already ≥ PASS_SCORE_MIN)
+
+/**
+ * One measurement trial for a single object in one validation iteration.
+ * The full array is stored in SpatialDigest.validationTrials so the AI and
+ * dashboard can surface convergence reasoning.
+ */
+export interface PlausibilityTrial {
+  /** 1-based iteration index. */
+  iteration:        number;
+  uid:              string;
+  objectName:       string;
+  /** Dimensions entering this iteration. */
+  inputDims:        { width: number; height: number; depth: number };
+  /** Geometric / semantic anomaly detected. */
+  issue:            PlausibilityIssue;
+  /** Correction applied this iteration. */
+  action:           PlausibilityAction;
+  /** Dimensions after this iteration's correction. */
+  outputDims:       { width: number; height: number; depth: number };
+  /** Object-level plausibility score (0–100) AFTER correction. */
+  plausibilityScore: number;
+  /** True when this object is permanently excluded from clearance calculations. */
+  isGhostArtifact?: boolean;
+}
+
+/** Return value of runValidationLoop. */
+export interface ValidationResult {
+  /** Objects with OBB / heal corrections applied — digest-only; store unchanged. */
+  objects:           DetectedObject[];
+  /** Full per-object, per-iteration trial log. */
+  trials:            PlausibilityTrial[];
+  /** UIDs flagged as Scan Artifacts after maxIter failed attempts. */
+  ghostArtifactUids: string[];
+  /** Final Global Plausibility Score (0–100). */
+  globalScore:       number;
+}
+
+// ── Spatial Health Report ─────────────────────────────────────────────────────
+
+/** Per-object summary entry in the Spatial Health Report. */
+export interface SpatialHealthReportEntry {
+  objectName:      string;
+  uid:             string;
+  /** "healthy" — within tolerance; "healed" — corrections applied; "ghost" — Scan Artifact. */
+  status:          "healthy" | "healed" | "ghost";
+  /** Human-readable reason why healing was applied, or undefined when healthy. */
+  healingReason?:  string;
+  finalDims:       { width: number; height: number; depth: number };
+  plausibilityScore: number;
+}
+
+/**
+ * Structured report emitted with every SpatialDigest.
+ * Replaces ad-hoc console scanning — every healing event is documented here.
+ */
+export interface SpatialHealthReport {
+  /** ISO timestamp of report generation. */
+  generatedAt:  string;
+  globalScore:  number;
+  /** True when globalScore ≥ GLOBAL_TARGET_SCORE (90). */
+  passed:       boolean;
+  entries:      SpatialHealthReportEntry[];
+  healedCount:  number;
+  ghostCount:   number;
+  /** One-line summary safe to surface in the dashboard. */
+  summary:      string;
+}
+
+/** Human-readable reason mapped from each PlausibilityAction. */
+const HEALING_REASONS: Partial<Record<PlausibilityAction, string>> = {
+  "obb-reproject":   "OBB rotation correction — AABB aspect ratio restored to standard footprint",
+  "heal-height":     "Below Semantic Minimum — height and footprint snapped to anchor standard",
+  "anchor-clamp":    "Exceeds physical sanityMax — rescaled to anchor standard",
+  "room-fit-pass":   "Large-but-plausible — footprint verified within room floor plan",
+  "semantic-expand": "Sole-type Flexible Anchor — undersized scan expanded to user truth / standard",
+};
+
+// ── Geometry helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Diagonal-Invariant OBB Estimator.
+ *
+ * Recovers the true {width, depth} of a rotated rectangular object from its
+ * Axis-Aligned Bounding Box and the object's known standard aspect ratio.
+ *
+ * Mathematical basis — rotation preserves the 2-D diagonal:
+ *   W_aabb² + D_aabb² = W_true² + D_true²   (diagonal invariant)
+ *   W_true  / D_true  = r                    (known anchor aspect ratio)
+ *
+ * Solving:
+ *   D_true = sqrt((W_aabb² + D_aabb²) / (r² + 1))
+ *   W_true = r × D_true
+ *
+ * This is the maximum-likelihood reconstruction under uniform rotation
+ * uncertainty when no per-vertex orientation data is available.
+ */
+function estimateOBBFromAABB(
+  aabbW:    number,
+  aabbD:    number,
+  footprint: { widthM: number; depthM: number },
+): { width: number; depth: number } {
+  const r        = footprint.widthM / footprint.depthM;
+  const diagSq   = aabbW * aabbW + aabbD * aabbD;
+  const dTrue    = Math.sqrt(diagSq / (r * r + 1));
+  const wTrue    = r * dTrue;
+  return { width: +wTrue.toFixed(3), depth: +dTrue.toFixed(3) };
+}
+
+/**
+ * Returns true when the observed AABB aspect ratio deviates more than
+ * OBB_ROTATION_THRESHOLD from the anchor's expected footprint ratio —
+ * indicating likely scan-time rotation that squashed the bounding box.
+ */
+function isRotatedAABB(
+  aabbW:    number,
+  aabbD:    number,
+  footprint: { widthM: number; depthM: number },
+): boolean {
+  if (aabbW <= 0 || aabbD <= 0) return false;
+
+  // Diagonal plausibility guard: rotation preserves the AABB diagonal length.
+  // If the observed diagonal substantially exceeds the standard footprint diagonal,
+  // the object is genuinely larger (e.g. L-shaped sofa) — not a rotated standard.
+  const diagStd = Math.sqrt(footprint.widthM * footprint.widthM + footprint.depthM * footprint.depthM);
+  const diagObs = Math.sqrt(aabbW * aabbW + aabbD * aabbD);
+  if (diagObs > diagStd * (1 + OBB_ROTATION_THRESHOLD)) return false;
+
+  const observedR = aabbW / aabbD;
+  const expectedR = footprint.widthM / footprint.depthM;
+  // Use ratio-of-ratios: deviation is symmetric around 1.0
+  const rr = observedR > expectedR ? observedR / expectedR : expectedR / observedR;
+  return (rr - 1) > OBB_ROTATION_THRESHOLD;
+}
+
+// ── Plausibility scoring ──────────────────────────────────────────────────────
+
+/**
+ * Compute a 0–100 plausibility score for one object against its anchor.
+ *
+ * Penalty components (each 0–50):
+ *  • Anchor-axis deviation: how far the measured value on the anchor's
+ *    primary axis (height or width) deviates from anchor.standard.
+ *  • Footprint diagonal deviation: how far the observed floor-plan diagonal
+ *    deviates from the anchor's standard footprint diagonal.
+ *
+ * Objects with no matching anchor score 100 (vacuously plausible).
+ */
+function computeObjectPlausibilityScore(
+  obj:            DetectedObject,
+  anchors:        StandardAnchor[]     = STANDARD_ANCHORS,
+  roomDimensions: RoomDimensions | null = null,
+): number {
+  if (!obj.dimensions) return 100;
+  const anchor = anchors.find((a) => a.pattern.test(obj.name));
+  if (!anchor) return 100;
+
+  const measured  = anchor.dimension === "height"
+    ? obj.dimensions.height
+    : obj.dimensions.width;
+  const anchorPen = Math.min(50, (Math.abs(measured - anchor.standard) / anchor.standard) * 100);
+
+  let footprintPen = 0;
+  if (anchor.standardFootprint && obj.dimensions.depth > 0) {
+    const diagStd = Math.sqrt(
+      anchor.standardFootprint.widthM ** 2 + anchor.standardFootprint.depthM ** 2,
+    );
+    const diagObs = Math.sqrt(obj.dimensions.width ** 2 + obj.dimensions.depth ** 2);
+    const rawPen  = Math.min(50, (Math.abs(diagObs - diagStd) / diagStd) * 100);
+
+    // Valid expansion: the object is LARGER than standard but fits the room.
+    // A 100-inch sectional is not a scan artifact — it's a large piece of furniture.
+    // Suppress the footprint penalty so the plausibility score reflects reality.
+    const isValidExpansion =
+      diagObs > diagStd &&
+      roomDimensions != null &&
+      fitsInRoom(obj.dimensions.width, obj.dimensions.depth, roomDimensions);
+
+    footprintPen = isValidExpansion ? 0 : rawPen;
+  }
+
+  return Math.max(0, Math.round(100 - anchorPen - footprintPen));
+}
+
+/**
+ * Weighted average plausibility score across all objects that have a
+ * matching anchor.  Returns 100 when no anchored objects are present
+ * (vacuously plausible — no evidence of implausibility).
+ */
+export function computeGlobalPlausibilityScore(
+  objects:        DetectedObject[],
+  anchors:        StandardAnchor[]     = STANDARD_ANCHORS,
+  roomDimensions: RoomDimensions | null = null,
+): number {
+  const anchored = objects.filter(
+    (o) => o.dimensions && anchors.some((a) => a.pattern.test(o.name)),
+  );
+  if (anchored.length === 0) return 100;
+  const total = anchored.reduce(
+    (sum, o) => sum + computeObjectPlausibilityScore(o, anchors, roomDimensions), 0,
+  );
+  return +(total / anchored.length).toFixed(1);
+}
+
+// ── Recursive Validation Loop ─────────────────────────────────────────────────
+
+/**
+ * Returns true when a floor-plan footprint (w × d metres) can physically fit
+ * inside the room in at least one orientation.
+ */
+function fitsInRoom(w: number, d: number, room: RoomDimensions): boolean {
+  return (w <= room.width && d <= room.length) ||
+         (w <= room.length && d <= room.width);
+}
+
+/**
+ * Coordinate-Agnostic Geometric Validation Engine.
+ *
+ * Runs up to VALIDATION_MAX_ITER passes over the detected objects, each time:
+ *
+ *   A. Detect  — identify dimension anomalies against STANDARD_ANCHORS.
+ *   B. Correct — apply the most appropriate healing strategy:
+ *                  OBB re-projection   → diagonal-invariant width/depth recovery
+ *                  Height Heal         → snap to anchor.standard for pancakes
+ *                  Anchor Clamp        → uniform rescale for gross hallucinations
+ *   C. Score   — recompute Global Plausibility Score.
+ *   D. Exit    — stop when score ≥ GLOBAL_TARGET_SCORE or no corrections remain.
+ *
+ * After VALIDATION_MAX_ITER iterations, objects still below GHOST_PLAUSIBILITY_MIN
+ * are flagged as Scan Artifacts: their position is preserved for zone mapping but
+ * their dimensions are excluded from gap / clearance maths.
+ *
+ * All mutations are digest-only.  The store's detectedObjects is never touched.
+ *
+ * @param objects  Already-scaled DetectedObjects from the current digest pass.
+ * @param anchors  Reference library (defaults to STANDARD_ANCHORS).
+ * @param maxIter  Maximum correction iterations (default 3).
+ */
+export function runValidationLoop(
+  objects:        DetectedObject[],
+  anchors:        StandardAnchor[]     = STANDARD_ANCHORS,
+  maxIter:        number               = VALIDATION_MAX_ITER,
+  roomDimensions: RoomDimensions | null = null,
+): ValidationResult {
+  const trials:             PlausibilityTrial[] = [];
+  const ghostArtifactUids = new Set<string>();
+  const attemptCount      = new Map<string, number>();
+
+  // Shallow-clone objects so we can mutate dimensions without touching the store.
+  let working: DetectedObject[] = objects.map((o) => ({
+    ...o,
+    dimensions: o.dimensions ? { ...o.dimensions } : undefined,
+  }));
+
+  // ── Sole-type index ───────────────────────────────────────────────────────
+  // Pre-compute which UIDs are the only instance of their anchor type in the
+  // full object set.  This is the prerequisite for Flexible Anchor expansion:
+  // a 100-inch sectional in an apartment is the SOLE sofa → trust its size.
+  // Objects in the Japanese Loft that have no sofa → this set never includes
+  // a sofa UID → regression guarantee: Loft measurements are never touched.
+  const soleTypeUids = new Set<string>();
+  for (const anchor of anchors) {
+    const matches = working.filter(
+      (o) => o.dimensions && anchor.pattern.test(o.name),
+    );
+    if (matches.length === 1) soleTypeUids.add(matches[0].uid);
+  }
+
+  let globalScore = computeGlobalPlausibilityScore(working, anchors, roomDimensions);
+  console.log(
+    `[ValidationEngine] Init — Global Plausibility: ${globalScore.toFixed(1)}% ` +
+    `(${working.length} objects, max ${maxIter} iterations)`,
+  );
+
+  for (let iter = 1; iter <= maxIter; iter++) {
+    if (globalScore >= GLOBAL_TARGET_SCORE) {
+      console.log(
+        `[ValidationEngine] Score ${globalScore.toFixed(1)}% ≥ target ${GLOBAL_TARGET_SCORE}% ` +
+        `— converged after ${iter - 1} iteration(s)`,
+      );
+      break;
+    }
+
+    let anyCorrection = false;
+
+    for (let i = 0; i < working.length; i++) {
+      const obj = working[i];
+      if (!obj.dimensions || !obj.rawMeshDimensions) continue;
+      if (obj.isUserVerified)               continue;
+      if (ghostArtifactUids.has(obj.uid))   continue;
+
+      const anchor = anchors.find((a) => a.pattern.test(obj.name));
+      if (!anchor) continue;
+
+      // ── Pre-pass: Flexible Anchor sole-type check ────────────────────────
+      // A sole-type object's height can mask a catastrophically wrong footprint
+      // (e.g. sofa height 0.91m ≈ standard 0.86m → score=80 → passes the gate
+      //  despite width being 0.90m instead of 2.10m).  We catch this BEFORE
+      //  the score gate so the footprint is always corrected for sole objects.
+      if (anchor.standardFootprint && soleTypeUids.has(obj.uid)) {
+        const scaledW_pre = obj.dimensions.width;
+        const targetW_pre = (obj.verifiedDimensions && !obj.isUserVerified)
+          ? Math.max(obj.verifiedDimensions.width, anchor.standardFootprint.widthM)
+          : anchor.standardFootprint.widthM;
+        const targetD_pre = (obj.verifiedDimensions && !obj.isUserVerified)
+          ? Math.max(obj.verifiedDimensions.depth, anchor.standardFootprint.depthM)
+          : anchor.standardFootprint.depthM;
+
+        if (scaledW_pre < targetW_pre * 0.98) {
+          const inputDims_pre = { ...obj.dimensions };
+          const newDims_pre   = { ...obj.dimensions, width: targetW_pre, depth: targetD_pre };
+          working[i] = { ...obj, dimensions: newDims_pre };
+
+          const scoreAfter_pre = computeObjectPlausibilityScore(working[i], anchors, roomDimensions);
+          const attempts_pre   = (attemptCount.get(obj.uid) ?? 0) + 1;
+          attemptCount.set(obj.uid, attempts_pre);
+
+          console.log(
+            `[ScaleGuard] Sole-type expansion: "${obj.name}" corrected to ` +
+            `${targetW_pre.toFixed(2)}m via Semantic Expansion.`,
+          );
+
+          trials.push({
+            iteration: iter, uid: obj.uid, objectName: obj.name,
+            inputDims: inputDims_pre, issue: "sole-type-undersized",
+            action: "semantic-expand", outputDims: newDims_pre,
+            plausibilityScore: scoreAfter_pre,
+          });
+          anyCorrection = true;
+          continue; // expansion applied; skip remaining branches for this object
+        }
+      }
+
+      const scoreBefore = computeObjectPlausibilityScore(obj, anchors, roomDimensions);
+      if (scoreBefore >= PASS_SCORE_MIN) {
+        // Already within tolerance — record a pass entry only on iteration 1.
+        if (iter === 1) {
+          trials.push({
+            iteration: iter, uid: obj.uid, objectName: obj.name,
+            inputDims: { ...obj.dimensions }, issue: "none", action: "pass",
+            outputDims: { ...obj.dimensions }, plausibilityScore: scoreBefore,
+          });
+        }
+        continue;
+      }
+
+      const inputDims = { ...obj.dimensions };
+      const scaledW   = obj.dimensions.width;
+      const scaledH   = obj.dimensions.height;
+      const scaledD   = obj.dimensions.depth;
+
+      let issue:  PlausibilityIssue  = "none";
+      let action: PlausibilityAction = "pass";
+      let newDims = { ...obj.dimensions };
+
+      // ── A. Scan Hallucination — physically impossible size ─────────────────
+      const overWidth =
+        anchor.sanityMax != null && scaledW > anchor.sanityMax;
+      const underHeight =
+        anchor.sanityMinHeight != null && scaledH < anchor.sanityMinHeight * 0.5;
+
+      if (overWidth || underHeight) {
+        issue = "scan-hallucination";
+        const clampF = anchor.dimension === "height"
+          ? anchor.standard / scaledH
+          : anchor.standard / scaledW;
+        newDims = {
+          width:  +(scaledW * clampF).toFixed(3),
+          height: +(scaledH * clampF).toFixed(3),
+          depth:  +(scaledD * clampF).toFixed(3),
+        };
+        action = "anchor-clamp";
+
+      // ── B. OBB Rotation — AABB aspect ratio deviates from standard ─────────
+      } else if (
+        anchor.standardFootprint &&
+        isRotatedAABB(scaledW, scaledD, anchor.standardFootprint)
+      ) {
+        issue  = "obb-rotation";
+        const obb = estimateOBBFromAABB(scaledW, scaledD, anchor.standardFootprint);
+        newDims = { ...obj.dimensions, width: obb.width, depth: obb.depth };
+        action  = "obb-reproject";
+
+      // ── C. Pancake — confirmed flat raw scan, height still sub-standard ────
+      // A pancake rawHeight means the ENTIRE scan is unreliable (the voxeliser
+      // captured only the top surface).  When standardFootprint is available
+      // we restore all three dimensions to the known real-world size, not just
+      // height, so the footprint participates correctly in gap/clearance maths.
+      } else if (
+        anchor.sanityMinHeight != null &&
+        anchor.dimension === "height" &&
+        (obj.rawMeshDimensions.height ?? 0) < anchor.sanityMinHeight &&
+        scaledH < anchor.standard
+      ) {
+        issue   = "pancake";
+        newDims = anchor.standardFootprint
+          ? { width: anchor.standardFootprint.widthM, height: anchor.standard, depth: anchor.standardFootprint.depthM }
+          : { ...obj.dimensions, height: anchor.standard };
+        action  = "heal-height";
+
+      // ── D. Oversized — only clamp when dimension exceeds physical sanityMax ──
+      } else if (
+        anchor.sanityMax != null && (
+          (anchor.dimension === "height" && scaledH > anchor.sanityMax) ||
+          (anchor.dimension === "width"  && scaledW > anchor.sanityMax)
+        )
+      ) {
+        issue = "oversized";
+        const clampF = anchor.dimension === "height"
+          ? anchor.standard / scaledH
+          : anchor.standard / scaledW;
+        newDims = {
+          width:  +(scaledW * clampF).toFixed(3),
+          height: +(scaledH * clampF).toFixed(3),
+          depth:  +(scaledD * clampF).toFixed(3),
+        };
+        action = "anchor-clamp";
+      // ── F. Flexible Anchor — Sole-Type Semantic Expansion ────────────────────
+      // Fires when the object is the ONLY instance of its anchor type in the
+      // scene AND its footprint is still below the standard (or user-verified)
+      // target after all geometric corrections have been tried.
+      //
+      // Priority for the expansion target:
+      //   1. obj.verifiedDimensions (user's known real-world size — "100 inches")
+      //   2. anchor.standardFootprint (class default — "sofa is 2.10 m wide")
+      //
+      // Regression guarantee: the Japanese Loft has NO sofa → soleTypeUids never
+      // contains a sofa UID → this branch never fires for Loft objects.
+      } else if (
+        anchor.standardFootprint &&
+        soleTypeUids.has(obj.uid)
+      ) {
+        const targetW = (obj.verifiedDimensions && !obj.isUserVerified)
+          ? Math.max(obj.verifiedDimensions.width, anchor.standardFootprint.widthM)
+          : anchor.standardFootprint.widthM;
+        const targetD = (obj.verifiedDimensions && !obj.isUserVerified)
+          ? Math.max(obj.verifiedDimensions.depth, anchor.standardFootprint.depthM)
+          : anchor.standardFootprint.depthM;
+
+        if (scaledW < targetW * 0.98) {
+          // Width is below the expansion target — expand.
+          issue  = "sole-type-undersized";
+          newDims = { ...obj.dimensions!, width: targetW, depth: targetD };
+          action  = "semantic-expand";
+          console.log(
+            `[ScaleGuard] Sole-type expansion: "${obj.name}" corrected to ` +
+            `${targetW.toFixed(2)}m via Semantic Expansion.`,
+          );
+        } else {
+          // Already at or above target — just confirm room fit.
+          issue  = "none";
+          newDims = obj.dimensions!;
+          action  = "room-fit-pass";
+        }
+
+      } else {
+        // ── E. Plausibility Filter — large-but-plausible vs. room-impossible ──
+        // The object deviates from the anchor standard but has not triggered any
+        // hard-failure branch.  Check whether its footprint can physically fit
+        // inside the room before deciding whether to clamp or allow it.
+        //
+        // A 100-inch sectional (2.54 m wide) in a 5 × 4 m room → fits → pass.
+        // A 6 m sofa in a 4 × 3 m room → impossible → clamp to standard.
+        const fitsRoom = roomDimensions == null
+          ? true   // no room context available — give benefit of the doubt
+          : fitsInRoom(scaledW, scaledD, roomDimensions);
+
+        if (fitsRoom) {
+          issue  = "none";
+          newDims = obj.dimensions!;
+          action  = "room-fit-pass";
+          console.log(
+            `[ValidationEngine] ✓ Room-fit pass: "${obj.name}" ` +
+            `(${scaledW.toFixed(2)}×${scaledD.toFixed(2)}m) fits room floor plan — kept as-is.`,
+          );
+        } else {
+          // Footprint cannot fit the room in any orientation → genuine anomaly.
+          issue = "oversized";
+          const clampF = anchor.dimension === "height"
+            ? anchor.standard / scaledH
+            : anchor.standard / scaledW;
+          newDims = {
+            width:  +(scaledW * clampF).toFixed(3),
+            height: +(scaledH * clampF).toFixed(3),
+            depth:  +(scaledD * clampF).toFixed(3),
+          };
+          action = "anchor-clamp";
+          console.warn(
+            `[ValidationEngine] ⚠ Room-impossible: "${obj.name}" ` +
+            `(${scaledW.toFixed(2)}×${scaledD.toFixed(2)}m) exceeds room ` +
+            `(${roomDimensions!.width.toFixed(2)}×${roomDimensions!.length.toFixed(2)}m) — clamped.`,
+          );
+        }
+      }
+
+      // Apply correction (digest-only copy)
+      working[i] = { ...obj, dimensions: newDims };
+
+      const scoreAfter = computeObjectPlausibilityScore(working[i], anchors, roomDimensions);
+      const attempts   = (attemptCount.get(obj.uid) ?? 0) + 1;
+      attemptCount.set(obj.uid, attempts);
+
+      // ── Ghost Rejection — still implausible after maxIter ─────────────────
+      const isGhost = attempts >= maxIter && scoreAfter < GHOST_PLAUSIBILITY_MIN;
+      if (isGhost) {
+        ghostArtifactUids.add(obj.uid);
+        action = "ghost-reject";
+        console.warn(
+          `[ValidationEngine] 👻 Ghost Artifact: "${obj.name}" (uid=${obj.uid}) ` +
+          `score=${scoreAfter}% after ${attempts} attempt(s) — ` +
+          `excluded from gap/clearance calculations.`,
+        );
+      }
+
+      trials.push({
+        iteration: iter, uid: obj.uid, objectName: obj.name,
+        inputDims, issue, action, outputDims: newDims,
+        plausibilityScore: scoreAfter,
+        isGhostArtifact: isGhost || undefined,
+      });
+
+      console.log(
+        `[ValidationEngine] Trial ${iter} · "${obj.name}": ` +
+        `${issue} → ${action} ` +
+        `[${inputDims.width.toFixed(2)}×${inputDims.depth.toFixed(2)}×${inputDims.height.toFixed(2)}m]` +
+        ` → [${newDims.width.toFixed(2)}×${newDims.depth.toFixed(2)}×${newDims.height.toFixed(2)}m] ` +
+        `score: ${scoreBefore}% → ${scoreAfter}%`,
+      );
+
+      anyCorrection = true;
+    }
+
+    globalScore = computeGlobalPlausibilityScore(working, anchors, roomDimensions);
+    console.log(
+      `[ValidationEngine] Iteration ${iter} complete — ` +
+      `Global Plausibility: ${globalScore.toFixed(1)}% ` +
+      `(${ghostArtifactUids.size} ghost(s))`,
+    );
+
+    if (!anyCorrection) {
+      console.log(
+        `[ValidationEngine] No corrections this iteration — terminating at iter ${iter}`,
+      );
+      break;
+    }
+  }
+
+  if (ghostArtifactUids.size > 0) {
+    console.warn(
+      `[ValidationEngine] Final: ${ghostArtifactUids.size} Ghost Artifact(s) excluded: ` +
+      [...ghostArtifactUids].map((uid) => {
+        const o = working.find((x) => x.uid === uid);
+        return o ? `"${o.name}"` : uid;
+      }).join(", "),
+    );
+  }
+
+  return {
+    objects:           working,
+    trials,
+    ghostArtifactUids: [...ghostArtifactUids],
+    globalScore,
+  };
+}
+
+// ── Spatial Health Report generator ──────────────────────────────────────────
+
+/**
+ * Builds a Spatial Health Report from a completed ValidationResult.
+ *
+ * Called by buildSpatialDigest after every validation loop so that every
+ * digest carries a structured, human-readable account of what was healed and
+ * why — without the caller needing to parse raw trial logs.
+ */
+export function generateSpatialHealthReport(result: ValidationResult): SpatialHealthReport {
+  const entries: SpatialHealthReportEntry[] = result.objects.map((obj) => {
+    const objTrials = result.trials.filter((t) => t.uid === obj.uid);
+    const isGhost   = result.ghostArtifactUids.includes(obj.uid);
+
+    if (isGhost) {
+      const last = objTrials[objTrials.length - 1];
+      return {
+        objectName: obj.name,
+        uid:        obj.uid,
+        status:     "ghost",
+        healingReason: "Scan Artifact — dimensions excluded from spatial calculations",
+        finalDims:  obj.dimensions ?? { width: 0, height: 0, depth: 0 },
+        plausibilityScore: last?.plausibilityScore ?? 0,
+      };
+    }
+
+    const correctionTrials = objTrials.filter(
+      (t) => t.action !== "pass" && t.action !== "ghost-reject" && t.action !== "room-fit-pass",
+    );
+
+    if (correctionTrials.length === 0) {
+      const last = objTrials[objTrials.length - 1];
+      return {
+        objectName: obj.name,
+        uid:        obj.uid,
+        status:     "healthy",
+        finalDims:  obj.dimensions ?? { width: 0, height: 0, depth: 0 },
+        plausibilityScore: last?.plausibilityScore ?? 100,
+      };
+    }
+
+    // Compile unique healing reasons from all corrections applied this run.
+    const reasons = [...new Set(
+      correctionTrials.map((t) => HEALING_REASONS[t.action] ?? t.action),
+    )];
+
+    const last = objTrials[objTrials.length - 1];
+    return {
+      objectName:   obj.name,
+      uid:          obj.uid,
+      status:       "healed",
+      healingReason: reasons.join("; "),
+      finalDims:    obj.dimensions ?? { width: 0, height: 0, depth: 0 },
+      plausibilityScore: last?.plausibilityScore ?? 0,
+    };
+  });
+
+  const healedCount = entries.filter((e) => e.status === "healed").length;
+  const ghostCount  = entries.filter((e) => e.status === "ghost").length;
+  const passed      = result.globalScore >= GLOBAL_TARGET_SCORE;
+
+  const summary = passed
+    ? `✓ Spatial integrity OK — ${result.globalScore.toFixed(1)}% plausibility` +
+      (healedCount > 0 ? ` (${healedCount} healed)` : "")
+    : `⚠ Spatial integrity issues — ${result.globalScore.toFixed(1)}% plausibility, ` +
+      `${healedCount} healed, ${ghostCount} ghost artifact(s)`;
+
+  console.log(`[SpatialHealth] ${summary}`);
+  if (healedCount > 0) {
+    for (const e of entries.filter((x) => x.status === "healed")) {
+      console.log(
+        `[SpatialHealth]   "${e.objectName}" healed → ` +
+        `${e.finalDims.width.toFixed(2)}×${e.finalDims.depth.toFixed(2)}×${e.finalDims.height.toFixed(2)}m | ` +
+        `reason: ${e.healingReason}`,
+      );
+    }
+  }
+
+  return {
+    generatedAt: new Date().toISOString(),
+    globalScore: result.globalScore,
+    passed,
+    entries,
+    healedCount,
+    ghostCount,
+    summary,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

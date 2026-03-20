@@ -3,6 +3,7 @@
 import { useState, useRef, KeyboardEvent } from "react";
 import { useAeroStore } from "@/store/useAeroStore";
 import { AnchorMatch, ScaleVector3 } from "@/utils/semanticScale";
+import { PreScanModal, type PreScanValues } from "@/components/ui/PreScanModal";
 
 /** Tailwind color class for a volumeAccuracy score. */
 function accuracyColor(score: number): string {
@@ -118,10 +119,14 @@ export function ChatInput() {
   const [input, setInput] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
+  // ── Pre-Scan Calibration modal state ──
+  const [preScanModal, setPreScanModal] = useState<"quick" | "deep" | null>(null);
+
   const sendMessage     = useAeroStore((s) => s.sendMessage);
   const clearHistory    = useAeroStore((s) => s.clearHistory);
   const triggerScan     = useAeroStore((s) => s.triggerScan);
-  const triggerDeepScan = useAeroStore((s) => s.triggerDeepScan);
+  const triggerDeepScan      = useAeroStore((s) => s.triggerDeepScan);
+  const setPendingRoomSpec   = useAeroStore((s) => s.setPendingRoomSpec);
   const aiMessage       = useAeroStore((s) => s.aiMessage);
   const isThinking      = useAeroStore((s) => s.isThinking);
   const isMoving        = useAeroStore((s) => s.isMoving);
@@ -138,13 +143,64 @@ export function ChatInput() {
   const rulerActive          = useAeroStore((s) => s.rulerActive);
   const setRulerActive       = useAeroStore((s) => s.setRulerActive);
   const anchorLog            = useAeroStore((s) => s.anchorLog);
-  const setVerifiedScaleFactor = useAeroStore((s) => s.setVerifiedScaleFactor);
+  const setVerifiedScaleFactor  = useAeroStore((s) => s.setVerifiedScaleFactor);
+  const masterCeilingHeight       = useAeroStore((s) => s.masterCeilingHeight);
+  const setMasterCeilingHeight    = useAeroStore((s) => s.setMasterCeilingHeight);
+  const setVerifiedXAxis          = useAeroStore((s) => s.setVerifiedXAxis);
+  const setVerifiedZAxis          = useAeroStore((s) => s.setVerifiedZAxis);
+  const verifiedXAxis             = useAeroStore((s) => s.verifiedXAxis);
+  const verifiedZAxis             = useAeroStore((s) => s.verifiedZAxis);
+  const anchorRoomType            = useAeroStore((s) => s.anchorRoomType);
+  const activatePreCalibration    = useAeroStore((s) => s.activatePreCalibration);
 
   // Tour requires room enclosure boundaries (always yields 3 corners)
   const canStartTour = roomDimensions !== null && !isTouring;
 
   const isBusy      = isThinking || isScanning || isDeepScanning;
   const isInputBusy = isThinking || isMoving || isScanning || isDeepScanning;
+
+  // ── Pre-scan modal handlers ──
+  function openPreScanModal(type: "quick" | "deep") {
+    if (isBusy) return;
+    setPreScanModal(type);
+  }
+
+  function handlePreScanConfirm(values: PreScanValues) {
+    const type = preScanModal;
+    setPreScanModal(null);
+
+    // Commit all three calibration values to the store atomically before
+    // the scan fires, so rawMeshDimensions are never computed without scale.
+    setMasterCeilingHeight(values.masterCeilingHeight);
+    setVerifiedXAxis(values.mainRoomWidth);
+    setVerifiedZAxis(values.mainRoomLength);
+
+    // Activate pre-calibration mode: locks scale to 1.0x and bypasses healers.
+    activatePreCalibration(values.anchorRoomType, values.mainRoomWidth);
+
+    // Stage room spec so resolveScan can create a hard-coded ScannedRoom
+    setPendingRoomSpec({
+      widthM:         values.mainRoomWidth,
+      lengthM:        values.mainRoomLength,
+      ceilingM:       values.masterCeilingHeight,
+      anchorRoomType: values.anchorRoomType,
+    });
+
+    console.log(
+      `[PreScan] Calibration committed — ` +
+      `ceiling=${values.masterCeilingHeight}m ` +
+      `width=${values.mainRoomWidth}m ` +
+      `length=${values.mainRoomLength}m. ` +
+      `Triggering ${type === "deep" ? "360° scan" : "quick scan"}.`,
+    );
+
+    if (type === "deep") triggerDeepScan();
+    else triggerScan();
+  }
+
+  function handlePreScanCancel() {
+    setPreScanModal(null);
+  }
 
   const handleSend = async () => {
     const trimmed = input.trim();
@@ -212,11 +268,11 @@ export function ChatInput() {
             {rulerActive ? "Ruler ON" : "Ruler"}
           </button>
 
-          {/* Deep Scan — secondary */}
+          {/* Perimeter Survey — room-by-room tour from each zone centre */}
           <button
-            onClick={triggerDeepScan}
+            onClick={() => openPreScanModal("deep")}
             disabled={isBusy}
-            title="Auto-discover objects with a full 360° room sweep"
+            title="360° scan — 8-frame spin from room centre, creates a new Room Object with hard-coded dimensions"
             className="flex items-center gap-1.5 rounded-lg border border-violet-500/40 bg-violet-500/15 px-3 py-1.5 text-xs font-medium text-violet-300/80 transition-colors hover:bg-violet-500/25 hover:text-violet-200 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {isDeepScanning ? (
@@ -238,7 +294,7 @@ export function ChatInput() {
 
           {/* Scan Room — primary focal point */}
           <button
-            onClick={triggerScan}
+            onClick={() => openPreScanModal("quick")}
             disabled={isBusy}
             title="Auto-discover objects in the current view"
             className="flex items-center gap-1.5 rounded-lg border border-sky-500/60 bg-sky-500/20 px-3 py-1.5 text-xs font-semibold text-sky-300 shadow-sm shadow-sky-900/40 transition-colors hover:bg-sky-500/35 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
@@ -390,6 +446,21 @@ export function ChatInput() {
           </svg>
         </button>
       </div>
+
+      {/* ── Pre-Scan Calibration Modal ── */}
+      {preScanModal && (
+        <PreScanModal
+          scanType={preScanModal}
+          initial={{
+            masterCeilingHeight: masterCeilingHeight ?? undefined,
+            mainRoomWidth:       verifiedXAxis       ?? undefined,
+            mainRoomLength:      verifiedZAxis       ?? undefined,
+            anchorRoomType:      anchorRoomType      ?? undefined,
+          }}
+          onConfirm={handlePreScanConfirm}
+          onCancel={handlePreScanCancel}
+        />
+      )}
     </div>
   );
 }

@@ -308,6 +308,37 @@ const chatSchema = {
 
 // ─── Discover mode (vision object detection) ───────────────────────────────────
 
+const zoneItemSchema = {
+  type: SchemaType.OBJECT,
+  properties: {
+    id: {
+      type: SchemaType.STRING,
+      description: "Zone identifier slug, e.g. 'kitchen', 'living-room', 'bedroom'",
+    },
+    label: {
+      type: SchemaType.STRING,
+      description: "Human-readable zone name, e.g. 'Kitchen', 'Living Room'",
+    },
+    xMin: {
+      type: SchemaType.NUMBER,
+      description: "Left boundary of the zone in metres from room origin (0 = left wall)",
+    },
+    xMax: {
+      type: SchemaType.NUMBER,
+      description: "Right boundary of the zone in metres",
+    },
+    zMin: {
+      type: SchemaType.NUMBER,
+      description: "Near boundary of the zone in metres from room origin (0 = viewer-side wall)",
+    },
+    zMax: {
+      type: SchemaType.NUMBER,
+      description: "Far boundary of the zone in metres",
+    },
+  },
+  required: ["id", "label", "xMin", "xMax", "zMin", "zMax"] as string[],
+};
+
 const discoverSchema = {
   type: SchemaType.OBJECT,
   properties: {
@@ -353,9 +384,118 @@ const discoverSchema = {
         required: ["name", "x", "y", "confidence", "xLeft", "xRight", "yTop", "yBottom"] as string[],
       },
     },
+    zones: {
+      type: SchemaType.ARRAY,
+      description:
+        "Architectural zone map. REQUIRED — omitting this field invalidates the scan. " +
+        "Each zone covers a rectangular floor area in real-world metres. " +
+        "Adjacent zones MUST share an exact boundary (Kitchen.zMax === LivingRoom.zMin). " +
+        "Zones must collectively cover the entire room floor.",
+      items: zoneItemSchema,
+    },
+    isPreCalibrated: {
+      type: SchemaType.BOOLEAN,
+      description: "Set to true when anchor room dimensions are provided and used as the scale reference",
+    },
   },
-  required: ["objects"] as string[],
+  required: ["objects", "zones"] as string[],
 };
+
+/**
+ * Builds the Spatial Engineer system prompt injected into the discover pass
+ * when the user has supplied anchor room dimensions before the scan.
+ */
+function buildSpatialEngineerContext(
+  anchorRoomType: string,
+  anchorWidth:    number,
+  masterCeiling:  number,
+  anchorLength?:  number,
+): string {
+  const hasLength = anchorLength != null && anchorLength > 0;
+  const zMax      = hasLength ? anchorLength! : null;
+  // Suggest a split point at the midpoint when no visible floor transition is apparent.
+  const zSplit    = zMax != null ? +(zMax / 2).toFixed(2) : null;
+
+  const xBound = `X: 0–${anchorWidth}m`;
+  const zBound = zMax != null ? `, Z: 0–${zMax}m` : "";
+
+  return [
+    `CONTEXT: You are a Spatial Engineer performing pre-calibrated object detection.`,
+    ``,
+    `GROUND TRUTH (user tape-measured — treat as absolute):`,
+    `  • The ${anchorRoomType} is exactly ${anchorWidth}m wide.`,
+    `  • The ceiling height is ${masterCeiling}m.`,
+    ...(hasLength ? [`  • The room is ${zMax}m long (depth, Z-axis).`] : []),
+    ``,
+    `TASK:`,
+    `  1. Locate the ${anchorRoomType} in the image(s).`,
+    `  2. Use ${anchorWidth}m as the absolute ruler for the ${anchorRoomType} zone.`,
+    `  3. Proportionally estimate all other visible zones (Kitchen, Dining, Hallway, Bedroom)`,
+    `     relative to this anchor — do NOT guess; derive from the anchor width.`,
+    `  4. Mark zone boundaries at visible floor transitions, material changes, or level changes.`,
+    `  5. Set "isPreCalibrated": true in the output JSON to confirm anchor calibration was applied.`,
+    ``,
+    `ZONE OUTPUT (required field "zones" in output JSON):`,
+    `  Divide the floor into semantic zones. Each zone: { id, label, xMin, xMax, zMin, zMax } in metres.`,
+    `  Room origin (0, 0) is the near-left corner. X grows rightward. Z grows away from the viewer.`,
+    ``,
+    `  ADJACENCY RULE — adjacent zones MUST share an exact boundary line:`,
+    `    Kitchen.zMax MUST equal LivingRoom.zMin. No gap. No overlap.`,
+    ``,
+    `  COMPLETENESS RULE — zones must cover the entire room floor:`,
+    ...(hasLength
+      ? [
+          `    Collectively, zones must span X: 0–${anchorWidth}m and Z: 0–${zMax}m.`,
+          ...(zSplit != null
+            ? [`    If no visible floor transition is apparent, split at Z=${zSplit}m.`]
+            : []),
+        ]
+      : [`    Zones must span the full X-width from 0 to ${anchorWidth}m.`]),
+    ``,
+    `  EXAMPLE (for a ${anchorWidth}m × ${zMax ?? "N"}m room):`,
+    `    { "id": "kitchen",     "label": "Kitchen",     "xMin": 0, "xMax": ${anchorWidth}, "zMin": 0,       "zMax": ${zSplit ?? "??"} }`,
+    `    { "id": "living-room", "label": "Living Room", "xMin": 0, "xMax": ${anchorWidth}, "zMin": ${zSplit ?? "??"}, "zMax": ${zMax ?? "??"} }`,
+    ``,
+    `COORDINATE CLAMPING — no object centroid may be placed outside the room boundary:`,
+    `  ${xBound}${zBound}. Any object whose inferred world position exceeds these bounds`,
+    `  must be pulled back to the nearest zone boundary before inclusion in "objects".`,
+    ``,
+    `SCALE RULE: Every object dimension you report must be consistent with the`,
+    `${anchorRoomType} being ${anchorWidth}m wide. If an object appears wider than the`,
+    `anchor room, it is a scan error — reduce confidence to 0.8 and report it anyway.`,
+  ].join("\n");
+}
+
+// ─── Zone fallback builder ─────────────────────────────────────────────────────
+
+/**
+ * Generates a minimal zone array when Gemini omits the "zones" field.
+ * Produces one or two zones depending on available anchor dimensions:
+ *   • With width + length: splits along the Z midpoint into two named zones.
+ *   • With width only:     creates a single full-width zone.
+ *   • With neither:        creates a generic 5×5m placeholder zone.
+ */
+function buildFallbackZones(
+  anchorRoomType: string | null,
+  anchorWidth:    number | null,
+  anchorLength:   number | null,
+): Array<{ id: string; label: string; xMin: number; xMax: number; zMin: number; zMax: number }> {
+  const w = anchorWidth  ?? 5.0;
+  const l = anchorLength ?? 5.0;
+  const label = anchorRoomType ?? "Room";
+  const id    = label.toLowerCase().replace(/\s+/g, "-");
+
+  if (anchorLength != null) {
+    // Split Z at midpoint into two zones
+    const mid = +(l / 2).toFixed(2);
+    return [
+      { id, label, xMin: 0, xMax: w, zMin: 0, zMax: mid },
+      { id: "secondary-zone", label: "Secondary Zone", xMin: 0, xMax: w, zMin: mid, zMax: l },
+    ];
+  }
+
+  return [{ id, label, xMin: 0, xMax: w, zMin: 0, zMax: l }];
+}
 
 // ─── Route handler ─────────────────────────────────────────────────────────────
 
@@ -457,8 +597,25 @@ async function handleDiscover(body: {
   mimeType?: string;
   canvasWidth?: number;
   canvasHeight?: number;
+  anchorRoomType?: string | null;
+  anchorWidth?: number | null;
+  anchorLength?: number | null;
+  masterCeiling?: number | null;
+  /** Set when re-examining an image after an implausible scale computation. */
+  refinementContext?: {
+    anchorObjA:  string;
+    anchorObjB:  string;
+    scaleFactor: number;
+    anchorWidth: number;
+  } | null;
+  walkthroughMode?: boolean;
+  perimeterTourMode?: boolean;
 }) {
-  const { image, mimeType = "image/jpeg", canvasWidth = 800, canvasHeight = 600 } = body;
+  const {
+    image, mimeType = "image/jpeg", canvasWidth = 800, canvasHeight = 600,
+    anchorRoomType = null, anchorWidth = null, anchorLength = null, masterCeiling = null,
+    refinementContext = null, walkthroughMode = false, perimeterTourMode = false,
+  } = body;
 
   if (!image) {
     return NextResponse.json({ error: "No image provided" }, { status: 400 });
@@ -475,7 +632,83 @@ async function handleDiscover(body: {
   const floorThreshold   = Math.round(canvasHeight * 0.60);
   const ceilingThreshold = Math.round(canvasHeight * 0.35);
 
+  const hasAnchor = anchorRoomType != null && anchorWidth != null && masterCeiling != null;
+
   const prompt = [
+    // ── Autonomous Surveyor Protocol — always active for all scan modes ─────────
+    `AUTONOMOUS SURVEYOR PROTOCOL:`,
+    `You are not a passive camera. You are an autonomous spatial surveyor standing in the center of the space.`,
+    `Your task: mentally navigate to every sub-zone you can identify in the image(s).`,
+    ``,
+    `CRITICAL DISTANCE RULE — THRESHOLD-RELATIVE COORDINATES:`,
+    `  Do NOT calculate distances from your physical standing position (your feet / camera origin).`,
+    `  Instead, measure ALL dimensions from the THRESHOLD of each sub-zone:`,
+    `  • Living Room threshold = the boundary line where you would step INTO the living area.`,
+    `  • Kitchen threshold     = the visible dividing line between kitchen and adjacent zone.`,
+    `  • Bedroom threshold     = the doorway opening you would walk through to enter.`,
+    `  • Zone depth            = distance from that threshold to the far wall of the zone.`,
+    `  • Object position       = (metres from threshold, metres from the nearer side wall).`,
+    ``,
+    `VIRTUAL NAVIGATION — for each zone you identify:`,
+    `  1. Locate the zone's entry threshold in the image.`,
+    `  2. Virtually "walk" from your position to that threshold.`,
+    `  3. From the threshold, estimate the zone's depth and width.`,
+    `  4. Place objects using threshold-relative coordinates (not camera-relative).`,
+    ``,
+    // ── Walk-through / virtual-waypoint context ──────────────────────────────
+    ...(walkthroughMode
+      ? [
+          `VIRTUAL WAYPOINT CONTEXT: This image is a ZOOMED crop centred on a detected threshold.`,
+          `  • Focus entirely on the architectural boundary visible here.`,
+          `  • Identify the exact Exit Point of the near zone and the Entry Point of the far zone.`,
+          `  • Use object scale changes across the boundary to verify depth: objects that appear ` +
+          `smaller on the far side are proportionally further away — use the pixel-density ratio ` +
+          `to calibrate the far zone's dimensions relative to the anchor room.`,
+          `  • Return precise zone boundaries at this threshold, not a full-room zone map.`,
+          ``,
+        ]
+      : []
+    ),
+    // ── Perimeter tour mode — human-centric room-by-room capture ─────────────
+    ...(perimeterTourMode
+      ? [
+          `ROOM-BY-ROOM TOUR MODE:`,
+          `You are receiving a complete tour of a space, room by room.`,
+          `Each set of 4 images was captured from the CENTRE of a specific room.`,
+          ``,
+          `Use this clear 360° human-eye perspective to:`,
+          `  • Provide exact wall-to-wall measurements for THIS room only.`,
+          `  • Do NOT cross-contaminate zone dimensions — each room's footprint ends at its walls.`,
+          `  • Place all objects relative to THIS room's walls, not the global origin.`,
+          `  • The camera is at the room's geometric centre — distances to each wall are equal ` +
+          `in all 4 cardinal directions (within ±20% for non-square rooms).`,
+          `  • Use the 4-angle coverage to resolve occlusions and confirm object positions.`,
+          ``,
+        ]
+      : []
+    ),
+    // ── Refinement context — injected first so it governs all decisions ────────
+    ...(refinementContext != null
+      ? [
+          `REFINEMENT PASS: The previous spatial analysis produced an implausible scale factor ` +
+          `(${refinementContext.scaleFactor.toFixed(2)}×). ` +
+          `A factor this far from 1.0× means the measured distance between ` +
+          `"${refinementContext.anchorObjA}" and "${refinementContext.anchorObjB}" was ` +
+          `inconsistent with the tape-measured anchor width of ${refinementContext.anchorWidth}m.`,
+          ``,
+          `Re-examine the image carefully and focus on:`,
+          `  1. The exact floor positions of "${refinementContext.anchorObjA}" and "${refinementContext.anchorObjB}".`,
+          `  2. Their true physical separation relative to the ${refinementContext.anchorWidth}m anchor width.`,
+          `  3. Verify zone boundaries — ensure no zone extends beyond the known room size.`,
+          `Output corrected object positions and zone boundaries. Prioritise accuracy over completeness.`,
+          ``,
+        ]
+      : []
+    ),
+    ...(hasAnchor
+      ? [buildSpatialEngineerContext(anchorRoomType!, anchorWidth!, masterCeiling!, anchorLength ?? undefined), ``]
+      : []
+    ),
     `Object-detection for a 3D property scan. Image: ${canvasWidth}×${canvasHeight}px.`,
     ``,
     `TASK: ID every visible furniture/fixture. Short lowercase names ("sofa", "coffee table", "tv").`,
@@ -493,6 +726,54 @@ async function handleDiscover(body: {
     `  Prefer specific names: "dining table" over "table" when chairs are present.`,
     ``,
     `CONFIDENCE: 1.0 = certain; 0.8–0.95 = partial occlusion/ambiguity; < 0.8 = omit.`,
+    ``,
+    `ZONE MAP — field "zones" — REQUIRED in every response:`,
+    `  TASK: Analyze the floor plane across all scan images. Identify EVERY distinct functional area.`,
+    `  Examples: Kitchen, Living Room, Dining Room, Hallway, Entry, Office Corner, Bedroom.`,
+    ``,
+    `  ZONE LOGIC — Functional Schema:`,
+    `    • A zone is defined by its SEMANTIC PURPOSE, not its physical size.`,
+    `    • If a kitchen is 2 meters or 10 meters wide, it is ONE zone until the furniture TYPE changes.`,
+    `    • A zone ends and a new one begins when the dominant furniture/appliance class transitions.`,
+    `      Examples of transitions:`,
+    `        appliances (fridge, stove, sink) → seating (sofa, tv)  = Kitchen → Living Room boundary`,
+    `        seating (sofa, armchair) → sleeping (bed, nightstand)  = Living Room → Bedroom boundary`,
+    `        any zone → narrow pass (< 1.5m wide)                   = Hallway / Entry boundary`,
+    `    • Use floor material changes, appliance groupings, or furniture class changes as zone markers.`,
+    `    • For every distinct area you identify, you MUST create a Zone entry in "zones".`,
+    `    • There is NO limit to the number of zones — use as many as the space demands.`,
+    `    • Use lowercase hyphenated ids: "kitchen", "living-room", "dining-room", "hallway", "entry".`,
+    ``,
+    `  BOUNDARY MATH:`,
+    `    • Zones must be adjacent — the boundary of Zone A must align exactly with the start of Zone B.`,
+    `    • Use floor material transitions, furniture type gaps, or level changes as split markers.`,
+    `    • ZoneA.zMax MUST equal ZoneB.zMin for Z-adjacent zones (no gap, no overlap).`,
+    `    • ZoneA.xMax MUST equal ZoneB.xMin for X-adjacent zones.`,
+    ``,
+    `  EXAMPLE — 5.0m × 5.5m open-plan with three functional areas:`,
+    `    { "id": "kitchen",      "label": "Kitchen",      "xMin": 0, "xMax": 5.0, "zMin": 0,    "zMax": 1.83 }`,
+    `    { "id": "dining-room",  "label": "Dining Room",  "xMin": 0, "xMax": 5.0, "zMin": 1.83, "zMax": 3.0  }`,
+    `    { "id": "living-room",  "label": "Living Room",  "xMin": 0, "xMax": 5.0, "zMin": 3.0,  "zMax": 5.5  }`,
+    `    ✓ kitchen.zMax(1.83) = dining.zMin(1.83)   ✓ dining.zMax(3.0) = living.zMin(3.0)`,
+    ``,
+    `  COMPLETENESS: Zones must collectively cover the entire visible floor — no unclaimed area.`,
+    ...(anchorWidth != null && anchorLength != null
+      ? [
+          ``,
+          `  COORDINATE LIMITS: The full scan MUST fit within ${anchorWidth}m × ${anchorLength}m.`,
+          `    • No object centroid may be placed outside X: 0–${anchorWidth}m or Z: 0–${anchorLength}m.`,
+          `    • No zone boundary may exceed these limits.`,
+          `    • Example violation: a painting at Z=${(anchorLength * 1.14).toFixed(2)} when the room ends at Z=${anchorLength} is invalid.`,
+        ]
+      : anchorWidth != null
+      ? [
+          ``,
+          `  COORDINATE LIMITS: The room is ${anchorWidth}m wide. No object or zone may exceed X=${anchorWidth}m.`,
+        ]
+      : []),
+    ``,
+    `  PRE-CALIBRATION: You MUST include "isPreCalibrated": true in the root of the JSON` +
+      (hasAnchor ? ` (anchor dimensions have been provided — this is mandatory).` : `.`),
   ].join("\n");
 
   const result = await model.generateContent({
@@ -513,14 +794,48 @@ async function handleDiscover(body: {
   // are in the correct pixel space or have been normalised/scaled by Gemini.
   console.log(`[AeroPilot Vision] raw response (canvas ${canvasWidth}×${canvasHeight}):`, responseText);
 
-  type RawObj = { name: string; x: number; y: number; confidence: number; xLeft?: number; xRight?: number; yTop?: number; yBottom?: number };
-  let parsed: { objects: Array<RawObj> };
+  type RawZone = { id: string; label: string; xMin: number; xMax: number; zMin: number; zMax: number };
+  type RawObj  = { name: string; x: number; y: number; confidence: number; xLeft?: number; xRight?: number; yTop?: number; yBottom?: number };
+  let parsed: { objects: Array<RawObj>; zones?: Array<RawZone>; isPreCalibrated?: boolean };
   try {
     parsed = JSON.parse(responseText);
   } catch {
     console.error("[AeroPilot Vision] JSON parse failed:", responseText);
     return NextResponse.json({ error: "Vision AI returned malformed response" }, { status: 500 });
   }
+
+  // ── Spatial Fragmentation Guard — fallback instead of hard failure ───────────
+  // When zones are absent, generate a synthetic zone from anchor dimensions so
+  // the rest of the spatial pipeline can still run. A hard 422 would discard all
+  // successfully detected objects; the fallback preserves them.
+  let zones: RawZone[];
+  if (!parsed.zones || parsed.zones.length === 0) {
+    console.error(
+      `[Spatial Fragmentation] Vision model returned no zone boundaries for this pass. ` +
+      `Generating server-side fallback zone. Raw tail: ${responseText.slice(0, 300)}`
+    );
+    zones = buildFallbackZones(anchorRoomType, anchorWidth, anchorLength);
+    console.warn(
+      `[Spatial Fragmentation] Fallback zone(s) created: ` +
+      zones.map((z) => `${z.label}[X:${z.xMin}–${z.xMax}, Z:${z.zMin}–${z.zMax}]`).join(" | ")
+    );
+  } else {
+    zones = parsed.zones;
+  }
+
+  // ── Zone diagnostic log ────────────────────────────────────────────────────
+  console.log(
+    `[AeroPilot Vision] Zone map (${zones.length} zone(s)):`,
+    zones.map((z) =>
+      `[${z.label}: X ${z.xMin.toFixed(2)}–${z.xMax.toFixed(2)}m, ` +
+      `Z ${z.zMin.toFixed(2)}–${z.zMax.toFixed(2)}m ` +
+      `(${((z.xMax - z.xMin) * (z.zMax - z.zMin)).toFixed(1)}m²)]`
+    ).join("  |  ")
+  );
+
+  // When anchor values were supplied, treat the scan as pre-calibrated even if
+  // Gemini omitted the flag (schema may not always honour optional booleans).
+  const isPreCalibrated = parsed.isPreCalibrated === true || hasAnchor;
 
   // Sanity-check: warn if any coordinate looks suspiciously small (likely
   // normalised 0–1 or percentage 0–100 instead of absolute pixels).
@@ -570,5 +885,13 @@ async function handleDiscover(body: {
     ).join(" | ")
   );
 
-  return NextResponse.json({ objects: clamped });
+  if (hasAnchor) {
+    console.log(
+      `[AeroPilot Vision] Pre-calibrated scan — anchor: "${anchorRoomType}" ${anchorWidth}m wide` +
+      `${anchorLength != null ? ` × ${anchorLength}m long` : ""}, ` +
+      `ceiling ${masterCeiling}m. isPreCalibrated=${isPreCalibrated}`,
+    );
+  }
+
+  return NextResponse.json({ objects: clamped, zones, isPreCalibrated });
 }

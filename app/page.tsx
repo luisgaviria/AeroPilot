@@ -4,12 +4,16 @@ import { ChatInput } from "@/components/ui/ChatInput";
 import { TourOverlay } from "@/components/ui/TourOverlay";
 import { DiagnosticDashboard } from "@/components/ui/DiagnosticDashboard";
 import { RulerOverlay } from "@/components/ui/RulerOverlay";
+import { WaypointScanOverlay } from "@/components/ui/WaypointScanOverlay";
 
 export default function Home() {
   return (
     <main className="relative h-screen w-screen overflow-hidden bg-black">
       {/* Cinematic tour overlay — centred at bottom, above canvas UI */}
       <TourOverlay />
+
+      {/* Walk-through scan overlay — fixed top-right, above camera view */}
+      <WaypointScanOverlay />
 
       {/* Reference Ruler prompt — appears when 2 floor points are placed */}
       <RulerOverlay />

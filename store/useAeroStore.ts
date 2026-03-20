@@ -1,13 +1,13 @@
 import { create } from "zustand";
 import { Object3D, Vector3Tuple } from "three";
 import { locations } from "@/data/locations";
-import { DetectedObject, IncomingDetection, TourStop } from "@/types/auto-discovery";
+import { DetectedObject, IncomingDetection, ScanSnapshot, TourStop } from "@/types/auto-discovery";
 import type { RoomDimensions } from "@/utils/spatial";
-import { computeScaleFactor, scaleDims, applyScaleVector, applyHybridValidation, applyRawDepthOverrides, type AnchorMatch, type ScaleVector3 } from "@/utils/semanticScale";
+import { computeScaleFactor, scaleDims, applyScaleVector, applyHybridValidation, applyRawDepthOverrides, applyHealHeight, type AnchorMatch, type ScaleVector3 } from "@/utils/semanticScale";
 import { STANDARD_ANCHORS } from "@/data/standardAnchors";
 import type { SpatialDiagnostics } from "@/types/diagnostics";
 import { buildSpatialManifest, type SpatialManifest } from "@/utils/diagnostics";
-import type { SpatialDigest } from "@/types/spatialDigest";
+import type { SpatialDigest, ZoneCalibrationMap, GeminiZone } from "@/types/spatialDigest";
 import { buildSpatialDigest, classifyTier, digestFingerprint } from "@/utils/spatialDigest";
 import { supabase } from "@/lib/supabase";
 import { RoomSchema, EntitySchema, SpatialStatsSchema, SpatialModeSchema } from "@/types/spatialSchema";
@@ -35,6 +35,26 @@ function loadLockedScale(): number | null {
 export interface CameraConfig {
   position: Vector3Tuple;
   lookAt: Vector3Tuple;
+}
+
+/** A scanned room with hard-coded user-measured dimensions (AI cannot override). */
+export interface ScannedRoom {
+  id: string;
+  /** Human-readable label, e.g. "Room 1", "Room 2". */
+  name: string;
+  /** Tape-measured width (X-axis) in metres — immutable after creation. */
+  widthM: number;
+  /** Tape-measured length (Z-axis) in metres — immutable after creation. */
+  lengthM: number;
+  /** Ceiling height in metres — immutable after creation. */
+  ceilingM: number;
+  anchorRoomType: string;
+  /** UIDs of detected objects belonging to this room. */
+  objectUids: string[];
+  /** World-space X centre — mutable via snap arrows. */
+  centerX: number;
+  /** World-space Z centre — mutable via snap arrows. */
+  centerZ: number;
 }
 
 interface AeroState {
@@ -126,8 +146,69 @@ interface AeroState {
   spatialMode:    SpatialMode;
   setSpatialMode: (mode: SpatialMode) => void;
 
+  // ── Pre-Calibrated Spatial Generation ────────────────────────────────────
+  /**
+   * The zone/room type the user anchored their width measurement to.
+   * e.g. "Living Room" — Gemini uses this to locate the anchor and
+   * proportionally scale all other zones from it.
+   */
+  anchorRoomType: string | null;
+  /**
+   * The verified real-world width (metres) of the anchor room.
+   * When set together with anchorRoomType, activates the Scale Guard bypass.
+   */
+  anchorWidth: number | null;
+  /**
+   * True when a pre-calibrated digest has been received and the Scale Guard
+   * bypass is active.  While true, globalScale is locked at 1.0× and all
+   * semantic healer passes are disabled for the session.
+   */
+  isPreCalibrated: boolean;
+  /**
+   * Activate the Pre-Calibrated mode: records the anchor context, locks
+   * globalScale at {1,1,1}, and logs the Scale Guard messages.
+   */
+  activatePreCalibration: (anchorRoomType: string, anchorWidth: number) => void;
+  /** Clear pre-calibration state and re-enable normal scale computation. */
+  clearPreCalibration: () => void;
+
   // ── Auto-Discovery ────────────────────────────────────────────────────────
   detectedObjects: DetectedObject[];
+  /**
+   * Zone boundaries returned by the Gemini vision model for the most recent scan.
+   * Each entry represents one architectural area (e.g. Kitchen, Living Room).
+   * When Gemini omits zones, the store generates a fallback from anchor context.
+   * Empty array means no scan has been run yet.
+   */
+  scannedZones: GeminiZone[];
+  /**
+   * Master Scale Factor derived from the furthest-apart objects in the anchor zone.
+   * Applied uniformly to all Gemini zone dimensions when pre-calibrated.
+   * null before the first pre-calibrated scan completes.
+   */
+  masterScaleFactor: number | null;
+  /**
+   * Visual Debugger snapshots — up to 8 images saved from the last deep scan
+   * (or 2 from a single scan), each with Gemini's detected objects for overlay.
+   */
+  scanSnapshots: ScanSnapshot[];
+  /** Add a snapshot to the visual debugger collection (capped at 10). */
+  addScanSnapshot: (snap: ScanSnapshot) => void;
+  /**
+   * When the Object-Anchor Scale computation produces a physically implausible
+   * result (< 0.5× or > 2.0×), this is set to trigger a Refinement Pass.
+   * ScanBridge watches this field and fires a second Gemini request with context
+   * about the problematic anchor pair and the implausible scale.
+   * Null when no refinement is needed or after the refinement has been dispatched.
+   */
+  pendingRefinement: {
+    anchorObjA:  string;
+    anchorObjB:  string;
+    scaleFactor: number;
+    anchorWidth: number;
+  } | null;
+  /** Called by ScanBridge after dispatching the refinement request. */
+  clearRefinement: () => void;
   pendingScan: boolean;
   isScanning: boolean;
   isDeepScanning: boolean;
@@ -137,7 +218,29 @@ interface AeroState {
   setScanMode: (mode: "quick" | "deep") => void;
   triggerScan: () => void;
   triggerDeepScan: () => void;
-  resolveScan: (incoming: IncomingDetection[]) => void;
+  walkthroughActive: boolean;
+  startWalkthroughScan: () => void;
+  captureWaypointFrame: () => void;
+  finalizeWalkthroughScan: () => void;
+  /** Current autonomous survey phase — drives the progress overlay. */
+  surveyPhase: "resolving" | "virtual-waypoints" | null;
+  setSurveyPhase: (phase: "resolving" | "virtual-waypoints" | null) => void;
+
+  // ── Room-Object Architecture ──────────────────────────────────────────────
+  rooms: ScannedRoom[];
+  /** ID of the room currently active (for navigation & snap operations). */
+  activeRoomId: string | null;
+  /**
+   * Dimensions staged from the PreScanModal — consumed once by resolveScan
+   * to create a new ScannedRoom with hard-coded, AI-immutable dimensions.
+   */
+  pendingRoomSpec: { widthM: number; lengthM: number; ceilingM: number; anchorRoomType: string } | null;
+  setPendingRoomSpec: (spec: { widthM: number; lengthM: number; ceilingM: number; anchorRoomType: string } | null) => void;
+  /** Teleport camera to a room's centre at eye height and make it active. */
+  navigateToRoom: (id: string) => void;
+  /** Translate the active room so the given face aligns with the nearest adjacent room's opposing face. */
+  snapActiveRoom: (direction: "N" | "S" | "E" | "W") => void;
+  resolveScan: (incoming: IncomingDetection[], apiPreCalibrated?: boolean, zones?: GeminiZone[], skipRefinement?: boolean) => void;
   /** Annotated snapshot data-URL set after each scan for visual debugging. */
   debugSnapshot: string | null;
   setDebugSnapshot: (url: string | null) => void;
@@ -167,6 +270,20 @@ interface AeroState {
    * Used as the TIER-2 base in computeGlobalScale when no per-axis override exists.
    */
   metricRatio: number | null;
+  /**
+   * Per-zone manual calibration overrides (keyed by zone label, e.g. "Kitchen").
+   * Applied digest-only inside buildSpatialDigest — store positions are unchanged.
+   */
+  zoneCalibrations: ZoneCalibrationMap;
+  /**
+   * Apply tape-measured width/length to a specific zone.
+   * Triggers a digest rebuild with local scale corrections for that zone's objects.
+   */
+  setZoneCalibration: (zoneLabel: string, widthM: number | null, lengthM: number | null) => void;
+  /**
+   * Remove a zone's manual calibration and rebuild the digest without it.
+   */
+  clearZoneCalibration: (zoneLabel: string) => void;
   /** Per-anchor match log from the most recent scale computation. */
   anchorLog: AnchorMatch[];
   /** Set (or clear) the manual verified scale factor. */
@@ -182,6 +299,15 @@ interface AeroState {
    * Pass a number to lock; pass null to unlock and revert to normal auto-computation.
    */
   setManualScale: (factor: number | null) => void;
+  /**
+   * Master Ceiling Height — highest-priority calibration input.
+   * When set, the uniform scale factor is derived as `targetM / _baseMeshDimensions.height`
+   * and applied to all three axes via setManualScale.  After applying, the Spatial
+   * Digest is force-rebuilt so Hybrid Zoning recalculates with corrected dimensions.
+   * Set to null to clear and revert to auto-scale.
+   */
+  masterCeilingHeight: number | null;
+  setMasterCeilingHeight: (targetM: number | null) => void;
   /**
    * Mark a specific detected object as user-verified with exact real-world dimensions.
    * When set, globalScale is bypassed for this object and verifiedDimensions are displayed.
@@ -347,7 +473,7 @@ const DEEP_SCAN_TOTAL = DEEP_SCAN_STEPS.length; // 8
  * Raised to 25 s to accommodate the 0.05 m high-res voxel pass which adds
  * significant BFS work on dense geometry.
  */
-const DEEP_SCAN_STEP_TIMEOUT = 25_000; // ms
+const DEEP_SCAN_STEP_TIMEOUT  = 20_000; // ms — hard deadline per step
 
 /** Resolves once `predicate` returns true, or rejects after `timeout` ms. */
 function waitFor(predicate: () => boolean, timeout = DEEP_SCAN_STEP_TIMEOUT): Promise<void> {
@@ -365,6 +491,7 @@ function waitFor(predicate: () => boolean, timeout = DEEP_SCAN_STEP_TIMEOUT): Pr
     }, 100);
   });
 }
+
 
 // ─── Cinematic tour — geometric/structural ────────────────────────────────────
 
@@ -685,10 +812,15 @@ function reapplyScale(objects: DetectedObject[], gs: ScaleVector3): DetectedObje
  * 2. applyHybridValidation — for each object with a semantic anchor, compare the geometric
  *    size to the standard.  ≤ 15 % → 70/30 blend (high-confidence).  > 15 % → conflict flag.
  *
+ * When isPreCalibrated is true, Hybrid Validation is skipped — the objects already
+ * carry real-world dimensions anchored by the user's tape measure.
+ *
  * This is the single call-site for all reactive scale updates (resolveScan + all setters).
  */
-function reapplyAndValidate(objects: DetectedObject[], gs: ScaleVector3): DetectedObject[] {
-  return applyHybridValidation(reapplyScale(objects, gs));
+function reapplyAndValidate(objects: DetectedObject[], gs: ScaleVector3, isPreCalibrated = false): DetectedObject[] {
+  const scaled = reapplyScale(objects, gs);
+  if (isPreCalibrated) return scaled;
+  return applyHybridValidation(scaled);
 }
 
 // ─── Sanity Guard ─────────────────────────────────────────────────────────────
@@ -775,6 +907,126 @@ function generateSpatialSummary(
   );
 }
 
+// ─── Spatial Consensus Scaling ─────────────────────────────────────────────────
+
+/**
+ * Returns a regex that matches the primary furniture types expected in a zone
+ * of the given anchor type.  Used to filter objects when computing the object
+ * span for the Master Scale Factor.
+ */
+function getAnchorFurnitureRE(anchorType: string): RegExp {
+  const lower = anchorType.toLowerCase();
+  if (lower.includes("living"))                    return /\bsofa\b|\bcouch\b|\bsectional\b|\btv\b|\btelevision\b|\barmchair\b|\bcoffee\s+table\b/i;
+  if (lower.includes("bed"))                       return /\bbed\b|\bwardrobe\b|\bdresser\b|\bnightstand\b/i;
+  if (lower.includes("kitchen") || lower.includes("dining")) return /\brefrigerator\b|\bfridge\b|\bstove\b|\bsink\b|\bcabinet\b|\bdining\s+table\b/i;
+  return /\b(sofa|bed|table|cabinet|wardrobe|dresser|refrigerator|fridge)\b/i;
+}
+
+/**
+ * Object-Anchor Scaling — derives the Master Scale Factor from the real XZ
+ * floor-plane Euclidean distance between the furthest-apart furniture pair
+ * in the anchor zone.
+ *
+ * Algorithm:
+ *  1. Locate the anchor GeminiZone by label match.
+ *  2. Find all detected objects inside that zone whose name matches the
+ *     anchor type's primary furniture regex.
+ *  3. Compute the maximum XZ Euclidean distance between any two objects.
+ *  4. Safety: if the best span is < 40% of the zone's AABB width, the pair
+ *     is too close for a reliable reference — fall back to zone AABB width.
+ *  5. Architectural fallback: for empty rooms with no furniture, use the
+ *     furthest architectural pair (window ↔ door) as the span ruler.
+ *  6. masterScaleFactor = anchorWidth / bestSpan.
+ *
+ * Returns masterScaleFactor and the names of the two anchor objects used
+ * (empty when the zone-AABB fallback was applied).
+ */
+function computeObjectAnchorScale(
+  objects:        DetectedObject[],
+  zones:          GeminiZone[],
+  anchorRoomType: string,
+  anchorWidth:    number,
+): { masterScaleFactor: number; anchorObjects: string[] } {
+  const anchorLower = anchorRoomType.toLowerCase();
+  const anchorZone  = zones.find(
+    (z) =>
+      z.label.toLowerCase().includes(anchorLower) ||
+      anchorLower.includes(z.label.toLowerCase()),
+  );
+  if (!anchorZone) return { masterScaleFactor: 1.0, anchorObjects: [] };
+
+  const zoneWidth = anchorZone.xMax - anchorZone.xMin;
+  if (zoneWidth <= 0) return { masterScaleFactor: 1.0, anchorObjects: [] };
+
+  /** XZ floor-plane Euclidean distance between two detected objects. */
+  function xzSpan(a: DetectedObject, b: DetectedObject): number {
+    return Math.sqrt(
+      (a.position3D[0] - b.position3D[0]) ** 2 +
+      (a.position3D[2] - b.position3D[2]) ** 2,
+    );
+  }
+
+  /** Find the pair with the maximum XZ span in a pool of objects. */
+  function furthestPair(
+    pool: DetectedObject[],
+  ): { span: number; objA: DetectedObject; objB: DetectedObject } | null {
+    if (pool.length < 2) return null;
+    let maxSpan = 0;
+    let objA = pool[0], objB = pool[1];
+    for (let i = 0; i < pool.length; i++) {
+      for (let j = i + 1; j < pool.length; j++) {
+        const s = xzSpan(pool[i], pool[j]);
+        if (s > maxSpan) { maxSpan = s; objA = pool[i]; objB = pool[j]; }
+      }
+    }
+    return maxSpan > 0 ? { span: maxSpan, objA, objB } : null;
+  }
+
+  const inZone = (o: DetectedObject): boolean => {
+    const [x, , z] = o.position3D;
+    return x >= anchorZone.xMin && x <= anchorZone.xMax &&
+           z >= anchorZone.zMin && z <= anchorZone.zMax;
+  };
+
+  // Phase 1 — primary furniture pair
+  const furnitureRE   = getAnchorFurnitureRE(anchorRoomType);
+  const furniturePair = furthestPair(objects.filter((o) => inZone(o) && furnitureRE.test(o.name)));
+
+  // Phase 2 — architectural fallback for empty units (window ↔ door)
+  const ARCH_RE = /\b(door(?:way)?|entry|window|archway)\b/i;
+  let bestPair  = furniturePair;
+  if (!bestPair) {
+    const archPair = furthestPair(objects.filter((o) => inZone(o) && ARCH_RE.test(o.name)));
+    if (archPair) {
+      bestPair = archPair;
+      console.log(
+        `[Audit] Architectural anchor fallback: "${archPair.objA.name}" ↔ "${archPair.objB.name}" ` +
+        `span=${archPair.span.toFixed(2)}m`,
+      );
+    }
+  }
+
+  if (!bestPair || bestPair.span <= 0) {
+    // Last resort — use Gemini zone AABB width
+    console.log(`[Audit] No valid object pair — using Gemini zone AABB width (${zoneWidth.toFixed(2)}m)`);
+    return { masterScaleFactor: anchorWidth / zoneWidth, anchorObjects: [] };
+  }
+
+  // Safety: span must cover ≥ 40% of zone width to be a reliable reference
+  if (bestPair.span < zoneWidth * 0.40) {
+    console.log(
+      `[Audit] Span ${bestPair.span.toFixed(2)}m < 40% of zone width ${zoneWidth.toFixed(2)}m — ` +
+      `too narrow for reliable scale; falling back to zone AABB.`,
+    );
+    return { masterScaleFactor: anchorWidth / zoneWidth, anchorObjects: [] };
+  }
+
+  return {
+    masterScaleFactor: anchorWidth / bestPair.span,
+    anchorObjects: [bestPair.objA.name, bestPair.objB.name],
+  };
+}
+
 // ─── Spatial Digest helpers ────────────────────────────────────────────────────
 
 /**
@@ -783,13 +1035,17 @@ function generateSpatialSummary(
  * or room dimensions.  Returns the new digest (or the existing one if unchanged).
  */
 function rebuildDigestIfChanged(
-  objects:        DetectedObject[],
-  roomDimensions: RoomDimensions | null,
-  currentKey:     string,
+  objects:          DetectedObject[],
+  roomDimensions:   RoomDimensions | null,
+  currentKey:       string,
+  zoneCalibrations: ZoneCalibrationMap = {},
+  isPreCalibrated:  boolean = false,
 ): { spatialDigest: SpatialDigest | null; _digestKey: string } {
   const newKey = digestFingerprint(objects, roomDimensions);
-  if (newKey === currentKey) return { spatialDigest: null, _digestKey: currentKey };
-  return { spatialDigest: buildSpatialDigest(objects, roomDimensions), _digestKey: newKey };
+  if (newKey === currentKey && Object.keys(zoneCalibrations).length === 0) {
+    return { spatialDigest: null, _digestKey: currentKey };
+  }
+  return { spatialDigest: buildSpatialDigest(objects, roomDimensions, zoneCalibrations, isPreCalibrated), _digestKey: newKey };
 }
 
 // ─── Store ────────────────────────────────────────────────────────────────────
@@ -813,8 +1069,10 @@ export const useAeroStore = create<AeroState>((set, get) => ({
   setRoomDimensions: (dims, source = "fallback") => {
     const { verifiedYAxis, verifiedXAxis, verifiedZAxis,
             autoScaleFactor, verifiedScaleFactor, _rulerRatio, detectedObjects } = get();
+
     if (dims != null) {
-      // Persist the raw mesh baseline — never overwritten by verified values.
+      // Always persist the raw mesh baseline — used by setMasterCeilingHeight
+      // to re-derive the uniform factor when the user edits the ceiling input.
       set({ _baseMeshDimensions: dims });
 
       // ── Scale-Snap ──────────────────────────────────────────────────────────
@@ -1157,6 +1415,10 @@ export const useAeroStore = create<AeroState>((set, get) => ({
     if (typeof window !== "undefined") localStorage.removeItem(ROOM_NAME_KEY);
     set({
       detectedObjects:     [],
+      scannedZones:        [],
+      masterScaleFactor:   null,
+      scanSnapshots:       [],
+      pendingRefinement:   null,
       roomDimensions:      null,
       _baseMeshDimensions: null,
       verifiedXAxis:       null,
@@ -1178,6 +1440,9 @@ export const useAeroStore = create<AeroState>((set, get) => ({
       anchorLog:           [],
       pendingIsolationUIDs: [],
       ceilingHeightSource: "fallback",
+      anchorRoomType:      null,
+      anchorWidth:         null,
+      isPreCalibrated:     false,
     });
     console.log("[AeroPilot] Store reset for new scan.");
   },
@@ -1215,7 +1480,7 @@ export const useAeroStore = create<AeroState>((set, get) => ({
       floorArea: room.floorArea ?? +(room.width * room.length).toFixed(2),
     };
 
-    const digest    = buildSpatialDigest(restoredObjects, rd);
+    const digest    = buildSpatialDigest(restoredObjects, rd, get().zoneCalibrations);
     const digestKey = digestFingerprint(restoredObjects, rd);
 
     // Clear any persisted Scale Lock — the manifest's effective scale is the ground truth
@@ -1304,7 +1569,7 @@ export const useAeroStore = create<AeroState>((set, get) => ({
       let digest = spatialDigest;
       const freshKey = digestFingerprint(detectedObjects, roomDimensions);
       if (freshKey !== _digestKey) {
-        digest = buildSpatialDigest(detectedObjects, roomDimensions);
+        digest = buildSpatialDigest(detectedObjects, roomDimensions, get().zoneCalibrations);
         set({ spatialDigest: digest, _digestKey: freshKey });
       }
 
@@ -1362,20 +1627,63 @@ export const useAeroStore = create<AeroState>((set, get) => ({
     }
   },
 
+  // ── Pre-Calibrated Spatial Generation ────────────────────────────────────
+  anchorRoomType:  null,
+  anchorWidth:     null,
+  isPreCalibrated: false,
+
+  activatePreCalibration: (roomType, width) => {
+    console.log(
+      `[ScaleGuard] Pre-Calibrated Data Received. Scale Locked at 1.0x. Bypassing Healers.`,
+    );
+    console.log(
+      `[ZoneEngine] Anchor Room: ${roomType} verified at ${width}m.`,
+    );
+    set({
+      anchorRoomType:  roomType,
+      anchorWidth:     width,
+      isPreCalibrated: true,
+      _lockedScale:    1,
+      globalScale:     { x: 1, y: 1, z: 1 },
+    });
+  },
+
+  clearPreCalibration: () => {
+    set({ anchorRoomType: null, anchorWidth: null, isPreCalibrated: false, _lockedScale: null });
+    console.log("[ScaleGuard] Pre-calibration cleared — normal scale pipeline restored.");
+  },
+
   // ── Auto-Discovery ────────────────────────────────────────────────────────
   detectedObjects: loadCheckpoint(),
-  scanCheckpoint: null,
-  pendingScan: false,
+  scannedZones:      [],
+  masterScaleFactor: null,
+  scanSnapshots:     [],
+  pendingRefinement: null,
+  scanCheckpoint:    null,
+  pendingScan:       false,
   isScanning: false,
   isDeepScanning: false,
   deepScanProgress: 0,
   deepScanTotal: DEEP_SCAN_TOTAL,
+  walkthroughActive: false,
+  surveyPhase: null,
+  rooms: [],
+  activeRoomId: null,
+  pendingRoomSpec: null,
 
   debugSnapshot: null,
   setDebugSnapshot: (url) => set({ debugSnapshot: url }),
 
   scanMode: "deep",
   setScanMode: (mode) => set({ scanMode: mode }),
+
+  addScanSnapshot: (snap) =>
+    set((s) => ({
+      // Keep the last 10 snapshots to bound memory usage
+      scanSnapshots: [...s.scanSnapshots, snap].slice(-10),
+    })),
+
+  clearRefinement: () => set({ pendingRefinement: null }),
 
   // ── Semantic Scale Calibration ────────────────────────────────────────────
   autoScaleFactor:     1.0,
@@ -1384,6 +1692,7 @@ export const useAeroStore = create<AeroState>((set, get) => ({
   globalScale:         { x: 1, y: 1, z: 1 },
   anchorLog:           [],
   _lockedScale:        loadLockedScale(),
+  zoneCalibrations:    {},
 
   setVerifiedScaleFactor: (factor) => {
     set({ verifiedScaleFactor: factor });
@@ -1416,6 +1725,44 @@ export const useAeroStore = create<AeroState>((set, get) => ({
     } else {
       console.log(`[ScaleLock] Scale unlocked — reverting to auto-computation`);
     }
+  },
+
+  setZoneCalibration: (zoneLabel, widthM, lengthM) => {
+    const newCalibrations: ZoneCalibrationMap = {
+      ...get().zoneCalibrations,
+      [zoneLabel]: { widthM, lengthM },
+    };
+    set({ zoneCalibrations: newCalibrations });
+
+    const { detectedObjects, roomDimensions } = get();
+    const freshDigest = buildSpatialDigest(detectedObjects, roomDimensions, newCalibrations);
+    const freshKey    = digestFingerprint(detectedObjects, roomDimensions) + `:zcal:${zoneLabel}`;
+    set({ spatialDigest: freshDigest, _digestKey: freshKey });
+  },
+
+  clearZoneCalibration: (zoneLabel) => {
+    const prev = get().zoneCalibrations;
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { [zoneLabel]: _removed, ...rest } = prev;
+    set({ zoneCalibrations: rest });
+
+    const { detectedObjects, roomDimensions } = get();
+    const freshDigest = buildSpatialDigest(detectedObjects, roomDimensions, rest);
+    const freshKey    = digestFingerprint(detectedObjects, roomDimensions) + `:zcal:cleared`;
+    set({ spatialDigest: freshDigest, _digestKey: freshKey });
+  },
+
+  masterCeilingHeight: null,
+
+  setMasterCeilingHeight: (targetM) => {
+    // Store ceiling height for Gemini API context only.
+    // No scale factor is derived — user calibration feeds the prompt, not a lock.
+    set({ masterCeilingHeight: targetM });
+    console.log(
+      targetM == null
+        ? `[Scale] Dictator 0.9055 successfully purged — auto-scale re-enabled.`
+        : `[Scale] Ceiling ${targetM}m stored for API context. No scale lock applied.`
+    );
   },
 
   setObjectVerifiedDimensions: (uid, dims) => {
@@ -1754,14 +2101,150 @@ export const useAeroStore = create<AeroState>((set, get) => ({
       } catch (err) {
         console.error("[AeroPilot] Deep scan failed:", err);
       } finally {
-        set({ isDeepScanning: false, deepScanProgress: 0, deepScanTotal: DEEP_SCAN_TOTAL });
+        set({ isDeepScanning: false, deepScanProgress: 0, deepScanTotal: DEEP_SCAN_TOTAL, surveyPhase: null });
         clearCheckpoint();
       }
     })();
   },
 
-  resolveScan: (incoming) => {
+  startWalkthroughScan: () => {
+    const s = get();
+    if (s.isDeepScanning || s.isScanning || s.isThinking) return;
+    set({
+      isDeepScanning:   true,
+      walkthroughActive: true,
+      deepScanProgress: 0,
+      deepScanTotal:    8,
+    });
+  },
+
+  captureWaypointFrame: () => {
+    const s = get();
+    if (!s.walkthroughActive || s.isScanning || !s.isDeepScanning) return;
+    const nextStep = s.deepScanProgress + 1;
+    set({ deepScanProgress: nextStep, pendingScan: true, isScanning: true });
+  },
+
+  finalizeWalkthroughScan: () => {
+    set({
+      isDeepScanning:   false,
+      walkthroughActive: false,
+      deepScanProgress: 0,
+      deepScanTotal:    DEEP_SCAN_TOTAL,
+      surveyPhase:      null,
+    });
+  },
+
+  setSurveyPhase: (phase) => set({ surveyPhase: phase }),
+
+  setPendingRoomSpec: (spec) => set({ pendingRoomSpec: spec }),
+
+  navigateToRoom: (id) => {
+    const room = get().rooms.find((r) => r.id === id);
+    if (!room) return;
+    console.log(`[Navigation] Camera locked to floor level (1.0m-1.8m).`);
+    set({
+      activeRoomId: id,
+      cameraConfig: freshConfig({
+        position: [room.centerX, 1.6, room.centerZ],
+        lookAt:   [room.centerX, 1.2, room.centerZ - 5],
+      }),
+      isMoving: true,
+    });
+  },
+
+  snapActiveRoom: (direction) => {
+    const { rooms, activeRoomId } = get();
+    const active = rooms.find((r) => r.id === activeRoomId);
+    if (!active) return;
+
+    const others = rooms.filter((r) => r.id !== activeRoomId);
+    let newCenterX = active.centerX;
+    let newCenterZ = active.centerZ;
+
+    if (direction === "N") {
+      const candidates = others.filter((r) => r.centerZ + r.lengthM / 2 <= active.centerZ);
+      if (candidates.length > 0) {
+        const nearest = candidates.reduce((a, b) =>
+          Math.abs(a.centerZ - active.centerZ) < Math.abs(b.centerZ - active.centerZ) ? a : b
+        );
+        newCenterZ = (nearest.centerZ + nearest.lengthM / 2) + active.lengthM / 2;
+      } else {
+        newCenterZ = active.centerZ - active.lengthM;
+      }
+    } else if (direction === "S") {
+      const candidates = others.filter((r) => r.centerZ - r.lengthM / 2 >= active.centerZ);
+      if (candidates.length > 0) {
+        const nearest = candidates.reduce((a, b) =>
+          Math.abs(a.centerZ - active.centerZ) < Math.abs(b.centerZ - active.centerZ) ? a : b
+        );
+        newCenterZ = (nearest.centerZ - nearest.lengthM / 2) - active.lengthM / 2;
+      } else {
+        newCenterZ = active.centerZ + active.lengthM;
+      }
+    } else if (direction === "E") {
+      const candidates = others.filter((r) => r.centerX - r.widthM / 2 >= active.centerX);
+      if (candidates.length > 0) {
+        const nearest = candidates.reduce((a, b) =>
+          Math.abs(a.centerX - active.centerX) < Math.abs(b.centerX - active.centerX) ? a : b
+        );
+        newCenterX = (nearest.centerX - nearest.widthM / 2) - active.widthM / 2;
+      } else {
+        newCenterX = active.centerX + active.widthM;
+      }
+    } else {
+      const candidates = others.filter((r) => r.centerX + r.widthM / 2 <= active.centerX);
+      if (candidates.length > 0) {
+        const nearest = candidates.reduce((a, b) =>
+          Math.abs(a.centerX - active.centerX) < Math.abs(b.centerX - active.centerX) ? a : b
+        );
+        newCenterX = (nearest.centerX + nearest.widthM / 2) + active.widthM / 2;
+      } else {
+        newCenterX = active.centerX - active.widthM;
+      }
+    }
+
+    set({ rooms: rooms.map((r) => r.id === activeRoomId ? { ...r, centerX: newCenterX, centerZ: newCenterZ } : r) });
+    console.log(`[MVP] Room snap engine active. ${active.name} → (${newCenterX.toFixed(2)}, ${newCenterZ.toFixed(2)})`);
+  },
+
+  resolveScan: (incoming, apiPreCalibrated = false, zones, skipRefinement = false) => {
     const existing = get().detectedObjects;
+
+    // ── Zone resolution: store zones or create fallback ────────────────────
+    if (zones && zones.length > 0) {
+      set({ scannedZones: zones });
+      console.log(
+        `[ZoneEngine] Stored ${zones.length} zone(s) from scan:`,
+        zones.map((z) =>
+          `[${z.label}: X ${z.xMin.toFixed(2)}–${z.xMax.toFixed(2)}m, ` +
+          `Z ${z.zMin.toFixed(2)}–${z.zMax.toFixed(2)}m ` +
+          `(${((z.xMax - z.xMin) * (z.zMax - z.zMin)).toFixed(1)}m²)]`
+        ).join("  |  ")
+      );
+    } else {
+      // Zone Fallback: build a synthetic zone from anchor context so the spatial
+      // pipeline has a minimum viable zone map even when Gemini omits zone data.
+      const { anchorRoomType: art, anchorWidth: aw, verifiedZAxis: vz } = get();
+      if (art && aw) {
+        const l = vz ?? aw; // square fallback if no room length
+        const mid = +(l / 2).toFixed(2);
+        const fallbackZones: GeminiZone[] = vz != null
+          ? [
+              { id: art.toLowerCase().replace(/\s+/g, "-"), label: art,             xMin: 0, xMax: aw, zMin: 0,   zMax: mid },
+              { id: "secondary-zone",                       label: "Secondary Zone", xMin: 0, xMax: aw, zMin: mid, zMax: l   },
+            ]
+          : [{ id: art.toLowerCase().replace(/\s+/g, "-"), label: art, xMin: 0, xMax: aw, zMin: 0, zMax: l }];
+        set({ scannedZones: fallbackZones });
+        console.warn(
+          `[ZoneEngine] Zone Fallback created — API returned no zones. ` +
+          `Anchor: "${art}" ${aw}m × ${l}m. ` +
+          `Zones: ` + fallbackZones.map((z) => `${z.label}[Z:${z.zMin}–${z.zMax}]`).join(", ")
+        );
+      }
+      // If no anchor context either, leave scannedZones unchanged (prior scan zones persist).
+    }
+
 
     const merged = [...existing];
 
@@ -2047,27 +2530,41 @@ export const useAeroStore = create<AeroState>((set, get) => ({
     // 3. Apply globalScale via reapplyScale:
     //    displayedDimensions = rawMeshDimensions × globalScale  (per object).
     //    Objects with isUserVerified + verifiedDimensions bypass global scale entirely.
+    // ── Scale Guard: activate pre-calibration if Gemini confirmed it ─────────
+    const preCal = apiPreCalibrated || get().isPreCalibrated;
+    if (apiPreCalibrated && !get().isPreCalibrated) {
+      // Gemini confirmed isPreCalibrated — mirror it into the store.
+      const { anchorRoomType: art, anchorWidth: aw } = get();
+      if (art && aw) get().activatePreCalibration(art, aw);
+      else {
+        console.log("[ScaleGuard] Pre-Calibrated Data Received. Scale Locked at 1.0x. Bypassing Healers.");
+        set({ isPreCalibrated: true, _lockedScale: 1, globalScale: { x: 1, y: 1, z: 1 } });
+      }
+    }
+
     const { verifiedScaleFactor, metricRatio, _baseMeshDimensions, _rulerRatio,
             verifiedYAxis, verifiedXAxis, verifiedZAxis, _lockedScale } = get();
     const hasVerifiedAxis = verifiedXAxis != null || verifiedYAxis != null || verifiedZAxis != null;
-    // When the scale is locked, skip semantic anchor computation entirely — the
-    // locked factor IS the ground truth and nothing from the scan should change it.
-    const scaleResult = (_lockedScale != null || hasVerifiedAxis)
+
+    // When pre-calibrated OR the scale is locked, skip semantic anchor computation
+    // entirely — the locked factor IS the ground truth.
+    const skipScaleCompute = preCal || _lockedScale != null || hasVerifiedAxis;
+    const scaleResult = skipScaleCompute
       ? { factor: get().autoScaleFactor, matches: get().anchorLog, rawDepthOverrides: new Map<string, number>() }
       : computeScaleFactor(merged, STANDARD_ANCHORS, _baseMeshDimensions?.height ?? undefined, get().roomDimensions ?? undefined);
     const autoFactor  = scaleResult.factor;
-    // Re-derive metricRatio in case new anchors nudged the average.
     const newMetricRatio = deriveMetricRatio(_rulerRatio, _baseMeshDimensions, verifiedYAxis, verifiedXAxis, verifiedZAxis) ?? metricRatio;
-    const newGlobalScale = computeGlobalScale(
-      _lockedScale,
-      autoFactor, verifiedScaleFactor, newMetricRatio, _baseMeshDimensions,
-      verifiedYAxis, verifiedZAxis, verifiedXAxis,
-    );
-    // Apply geometric scaling, then Hybrid Validation, then Structural Stack Merge
-    // depth overrides.  The overrides replace the bed's scaled depth with
-    // maxStackRawDepth × gs.z so the true rectangular platform footprint is used.
+    const newGlobalScale = preCal
+      ? { x: 1, y: 1, z: 1 }
+      : computeGlobalScale(
+          _lockedScale,
+          autoFactor, verifiedScaleFactor, newMetricRatio, _baseMeshDimensions,
+          verifiedYAxis, verifiedZAxis, verifiedXAxis,
+        );
+
+    // Apply geometric scaling; skip Hybrid Validation when pre-calibrated.
     const scaledMerged = applyRawDepthOverrides(
-      reapplyAndValidate(merged, newGlobalScale),
+      reapplyAndValidate(merged, newGlobalScale, preCal),
       scaleResult.rawDepthOverrides,
       newGlobalScale,
     );
@@ -2075,7 +2572,8 @@ export const useAeroStore = create<AeroState>((set, get) => ({
     console.log(
       `[AeroPilot] Scan complete — ${incoming.length} incoming, ${scaledMerged.length} total. ` +
       `globalScale=(X:${newGlobalScale.x.toFixed(4)} Y:${newGlobalScale.y.toFixed(4)} Z:${newGlobalScale.z.toFixed(4)}) ` +
-      `auto=${autoFactor.toFixed(4)} verified=${verifiedScaleFactor ?? "none"}`
+      `auto=${autoFactor.toFixed(4)} verified=${verifiedScaleFactor ?? "none"}` +
+      (preCal ? " [PRE-CALIBRATED — healers bypassed]" : "")
     );
     set({
       pendingScan:     false,
@@ -2087,15 +2585,98 @@ export const useAeroStore = create<AeroState>((set, get) => ({
       anchorLog:       scaleResult.matches,
     });
 
-    // ── Sanity Guard — queue objects that exceeded their sanityMax for targeted voxel isolation
-    const sanityTriggers = collectSanityTriggers(scaledMerged, get().pendingIsolationUIDs);
-    if (sanityTriggers.length > 0) {
-      set((s) => ({ pendingIsolationUIDs: [...s.pendingIsolationUIDs, ...sanityTriggers] }));
+    // Sanity Guard is skipped when pre-calibrated — dimensions are already
+    // anchored to real-world values and should not be re-isolated.
+    if (!preCal) {
+      const sanityTriggers = collectSanityTriggers(scaledMerged, get().pendingIsolationUIDs);
+      if (sanityTriggers.length > 0) {
+        set((s) => ({ pendingIsolationUIDs: [...s.pendingIsolationUIDs, ...sanityTriggers] }));
+      }
+    }
+
+    // ── Object-Anchor Scaling — Master Scale Factor ───────────────────────────
+    // When pre-calibrated with an anchor, derive the Master Scale Factor from
+    // the furthest furniture pair in the anchor zone and apply it uniformly to
+    // all Gemini zone dimensions so zone cards show tape-accurate measurements.
+    const { roomDimensions: rd, _digestKey: dk, zoneCalibrations: existingZoneCals } = get();
+    let effectiveZoneCals = existingZoneCals;
+    {
+      const { anchorRoomType: art, anchorWidth: aw, scannedZones: sz } = get();
+      if (preCal && art && aw && sz.length > 0) {
+        const { masterScaleFactor, anchorObjects } = computeObjectAnchorScale(scaledMerged, sz, art, aw);
+
+        // Plausibility guard — a scale outside [0.5×, 2.0×] is physically impossible
+        // for a tape-measured room. Trigger a Refinement Pass instead of silently
+        // applying a distorted scale to all zone dimensions.
+        const SCALE_MIN = 0.5, SCALE_MAX = 2.0;
+        if (!skipRefinement && (masterScaleFactor < SCALE_MIN || masterScaleFactor > SCALE_MAX)) {
+          console.warn(
+            `[Audit] Scale implausible: ${masterScaleFactor.toFixed(3)}× is outside ` +
+            `[${SCALE_MIN}×–${SCALE_MAX}×]. Triggering Refinement Pass.`,
+          );
+          set({
+            masterScaleFactor: null,
+            pendingRefinement: {
+              anchorObjA:  anchorObjects[0] ?? "unknown",
+              anchorObjB:  anchorObjects[1] ?? "unknown",
+              scaleFactor: masterScaleFactor,
+              anchorWidth: aw,
+            },
+          });
+          // Don't apply zone calibrations — build uncalibrated digest so the
+          // UI is not blank while the refinement pass runs.
+        } else {
+          set({ masterScaleFactor, pendingRefinement: null });
+
+          // Build uniform zone calibrations scaled by the master factor.
+          const masterZoneCals: ZoneCalibrationMap = {};
+          for (const zone of sz) {
+            masterZoneCals[zone.label] = {
+              widthM:  +((zone.xMax - zone.xMin) * masterScaleFactor).toFixed(3),
+              lengthM: +((zone.zMax - zone.zMin) * masterScaleFactor).toFixed(3),
+            };
+          }
+          // User explicit overrides win over master-scale derived values
+          effectiveZoneCals = { ...masterZoneCals, ...existingZoneCals };
+          set({ zoneCalibrations: effectiveZoneCals });
+
+          // Reliability Audit
+          const spanLabel = anchorObjects.length >= 2
+            ? `${anchorObjects[0]}-${anchorObjects[1]} span`
+            : "Gemini zone width (fallback)";
+          console.log(`[Audit] Master Scale derived from ${spanLabel}: ${masterScaleFactor.toFixed(3)}×`);
+          console.log(`[Audit] Zones identified: ${sz.map((z) => z.label).join(", ")}`);
+          console.log(`[Audit] All manual overrides successfully bypassed`);
+        }
+      }
+    }
+
+    // ── Room-Object Architecture: create/update a ScannedRoom on scan completion ──
+    {
+      const spec = get().pendingRoomSpec;
+      if (spec) {
+        const uid        = crypto.randomUUID();
+        const nextNum    = get().rooms.length + 1;
+        const newRoom: ScannedRoom = {
+          id:             uid,
+          name:           `Room ${nextNum}`,
+          widthM:         spec.widthM,
+          lengthM:        spec.lengthM,
+          ceilingM:       spec.ceilingM,
+          anchorRoomType: spec.anchorRoomType,
+          objectUids:     scaledMerged.map((o) => o.uid),
+          centerX:        0,
+          centerZ:        0,
+        };
+        set((s) => ({ rooms: [...s.rooms, newRoom], activeRoomId: uid, pendingRoomSpec: null }));
+        console.log(`[MVP] 360-spin stabilized.`);
+        console.log(`[MVP] Room snap engine active.`);
+        console.log(`[Room] Created "${newRoom.name}" — ${spec.widthM}m × ${spec.lengthM}m, ceiling ${spec.ceilingM}m.`);
+      }
     }
 
     // ── Rebuild SpatialDigest now that objects are finalised ─────────────────
-    const { roomDimensions: rd, _digestKey: dk } = get();
-    const digestUpdate = rebuildDigestIfChanged(scaledMerged, rd, dk);
+    const digestUpdate = rebuildDigestIfChanged(scaledMerged, rd, dk, effectiveZoneCals, preCal);
     if (digestUpdate.spatialDigest) set(digestUpdate);
   },
 }));

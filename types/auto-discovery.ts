@@ -146,6 +146,27 @@ export interface DetectedObject {
  */
 export type IncomingDetection = Omit<DetectedObject, "uid" | "scanCount">;
 
+/**
+ * A single scan snapshot with Gemini's detected objects, saved for the
+ * Visual Debugger so the dashboard can overlay bounding boxes and anchor pins.
+ */
+export interface ScanSnapshot {
+  /** Pass label: "pass1", "pass2", "deep-1", "refinement", etc. */
+  label:      string;
+  /** Full data URL (data:image/jpeg;base64,...) for display. */
+  dataUrl:    string;
+  /** MIME type of the image. */
+  mimeType:   string;
+  /** Original pixel width of the captured snapshot. */
+  width:      number;
+  /** Original pixel height of the captured snapshot. */
+  height:     number;
+  /** Gemini-detected objects with bounding box pixel coords for overlay drawing. */
+  objects:    VisionObject[];
+  /** Names of the two objects used as the scale anchor for this pass, if any. */
+  anchorObjects?: [string, string];
+}
+
 /** Raw shape returned by the Vision API endpoint before raycasting. */
 export interface VisionObject {
   name: string;

@@ -1,0 +1,809 @@
+{
+  "schema": "vista-spatial-manifest/v1",
+  "exportedAt": "2026-03-18T04:07:08.249Z",
+  "room": {
+    "width": 7.15,
+    "length": 8.38,
+    "height": 2.54,
+    "floorArea": 32.7
+  },
+  "scale": {
+    "auto": 0.9669,
+    "verified": null,
+    "effective": 0.9669,
+    "anchorCount": 2
+  },
+  "diagnostics": {
+    "verticalityError": 0,
+    "boundaryPlanes": {
+      "floor": false,
+      "ceiling": false,
+      "wallN": true,
+      "wallS": true,
+      "wallE": true,
+      "wallW": true
+    },
+    "ceilingHeightSource": "fallback",
+    "openingsDetected": 0
+  },
+  "wallPlanes": [
+    {
+      "face": "floor",
+      "normal": [
+        0,
+        -1,
+        0
+      ],
+      "distance": 0
+    },
+    {
+      "face": "ceiling",
+      "normal": [
+        0,
+        1,
+        0
+      ],
+      "distance": 2.54
+    },
+    {
+      "face": "N",
+      "normal": [
+        0,
+        0,
+        1
+      ],
+      "distance": 4.19
+    },
+    {
+      "face": "S",
+      "normal": [
+        0,
+        0,
+        -1
+      ],
+      "distance": 4.19
+    },
+    {
+      "face": "E",
+      "normal": [
+        1,
+        0,
+        0
+      ],
+      "distance": 3.575
+    },
+    {
+      "face": "W",
+      "normal": [
+        -1,
+        0,
+        0
+      ],
+      "distance": 3.575
+    }
+  ],
+  "objects": [
+    {
+      "uid": "c17acf24-3d26-4a3a-95c2-b98599c78243",
+      "name": "sofa",
+      "position": [
+        -1.275,
+        0.555,
+        -2.1000000000000005
+      ],
+      "dimensions": {
+        "width": 2.119,
+        "height": 0.867,
+        "depth": 2.119
+      },
+      "rawDimensions": {
+        "width": 1,
+        "height": 1,
+        "depth": 1.9
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 8
+    },
+    {
+      "uid": "7c627a86-c8be-4332-86c4-f06d06fe6ccd",
+      "name": "curtain",
+      "position": [
+        -2.4038461538461537,
+        0.6346153846153848,
+        -3.757692307692307
+      ],
+      "dimensions": {
+        "width": 2.03,
+        "height": 1.064,
+        "depth": 2.127
+      },
+      "rawDimensions": {
+        "width": 2.2,
+        "height": 1.1,
+        "depth": 2.2
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 11
+    },
+    {
+      "uid": "3187f641-9160-46b8-8e10-427c91f7ec10",
+      "name": "ceiling light",
+      "position": [
+        -0.675,
+        2.425,
+        -2.575
+      ],
+      "dimensions": {
+        "width": 0.048,
+        "height": 0.135,
+        "depth": 0.048
+      },
+      "rawDimensions": {
+        "width": 0.05,
+        "height": 0.14,
+        "depth": 0.05
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 99
+    },
+    {
+      "uid": "97902da1-4aec-4759-97f3-78d2177c0f2f",
+      "name": "upper cabinet",
+      "position": [
+        0.5750000000000001,
+        1.5312500000000002,
+        -3.770833333333334
+      ],
+      "dimensions": {
+        "width": 1.547,
+        "height": 0.483,
+        "depth": 0.774
+      },
+      "rawDimensions": {
+        "width": 2.2,
+        "height": 0.6,
+        "depth": 0.8
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 20
+    },
+    {
+      "uid": "ae5d73a7-64ed-4393-97c7-987432a8620d",
+      "name": "refrigerator",
+      "position": [
+        1.525,
+        0.838888888888889,
+        -2.858333333333333
+      ],
+      "dimensions": {
+        "width": 1.837,
+        "height": 0.193,
+        "depth": 0.677
+      },
+      "rawDimensions": {
+        "width": 2.2,
+        "height": 0.3,
+        "depth": 2.2
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 27
+    },
+    {
+      "uid": "ab8642f1-8b70-41a9-9630-9d7736e5eb87",
+      "name": "countertop",
+      "position": [
+        0.36428571428571427,
+        0.5357142857142857,
+        -3.3357142857142854
+      ],
+      "dimensions": {
+        "width": 1.12,
+        "height": 0.815,
+        "depth": 1.934
+      },
+      "rawDimensions": {
+        "width": 0.9,
+        "height": 0.6,
+        "depth": 1.5
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 5
+    },
+    {
+      "uid": "83982352-7624-420e-b462-892e568e11f9",
+      "name": "lower cabinets",
+      "position": [
+        0.04375,
+        0.3375,
+        -1.8937499999999998
+      ],
+      "dimensions": {
+        "width": 0.87,
+        "height": 0.58,
+        "depth": 1.45
+      },
+      "rawDimensions": {
+        "width": 0.9,
+        "height": 0.2,
+        "depth": 0.8
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 27
+    },
+    {
+      "uid": "54946072-91a3-4cc2-9605-ee55bddacfe6",
+      "name": "dishwasher",
+      "position": [
+        0.3321428571428572,
+        0.2714285714285714,
+        -2.4464285714285716
+      ],
+      "dimensions": {
+        "width": 2.127,
+        "height": 0.387,
+        "depth": 2.127
+      },
+      "rawDimensions": {
+        "width": 2.2,
+        "height": 0.4,
+        "depth": 2.2
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 35
+    },
+    {
+      "uid": "2bf2ed14-9445-4399-a5ae-f4908c2805fe",
+      "name": "window",
+      "position": [
+        0.2590973958491351,
+        1.2164010361838173,
+        -3.243702261846237
+      ],
+      "dimensions": {
+        "width": 5.227,
+        "height": 0.892,
+        "depth": 0.383
+      },
+      "rawDimensions": {
+        "width": 2.2,
+        "height": 0.6,
+        "depth": 0.8
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 3
+    },
+    {
+      "uid": "3f50f60d-b5c5-4d0c-8725-37bd6fa12407",
+      "name": "window blinds",
+      "position": [
+        1.4797321353917405,
+        0.9472790288008469,
+        -3.426874349559194
+      ],
+      "dimensions": {
+        "width": 1.547,
+        "height": 0.193,
+        "depth": 0.677
+      },
+      "rawDimensions": {
+        "width": 16,
+        "height": 0.3,
+        "depth": 0.2
+      },
+      "confidence": 1,
+      "isOpening": false
+    },
+    {
+      "uid": "a7d44810-55df-4e49-9bc1-d6c64197302b",
+      "name": "pillow",
+      "position": [
+        -0.9875000000000002,
+        0.5125000000000001,
+        -2.3375
+      ],
+      "dimensions": {
+        "width": 2.127,
+        "height": 0.87,
+        "depth": 2.127
+      },
+      "rawDimensions": {
+        "width": 2.2,
+        "height": 0.9,
+        "depth": 2.2
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 11
+    },
+    {
+      "uid": "435e3ca4-22fa-4af7-b5af-afa3b10dc383",
+      "name": "lower cabinet",
+      "position": [
+        0.225,
+        0.8833333333333334,
+        -1.5249999999999997
+      ],
+      "dimensions": {
+        "width": 1.837,
+        "height": 0.483,
+        "depth": 0.774
+      },
+      "rawDimensions": {
+        "width": 0.9,
+        "height": 0.5,
+        "depth": 0.5
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 17
+    },
+    {
+      "uid": "f27f4c8f-abda-4f1c-ae17-05330e9a9009",
+      "name": "coffee table",
+      "position": [
+        -0.9999999999999999,
+        0.5166666666666667,
+        -1.7333333333333332
+      ],
+      "dimensions": {
+        "width": 0.626,
+        "height": 0.439,
+        "depth": 0.876
+      },
+      "rawDimensions": {
+        "width": 0.4,
+        "height": 0.2,
+        "depth": 0.6
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 23
+    },
+    {
+      "uid": "c97d27e3-9653-4427-978a-ef3963c95d9c",
+      "name": "kitchen island",
+      "position": [
+        1.17,
+        0.31,
+        -1.7899999999999998
+      ],
+      "dimensions": {
+        "width": 2.127,
+        "height": 0.29,
+        "depth": 2.127
+      },
+      "rawDimensions": {
+        "width": 0.9,
+        "height": 0.2,
+        "depth": 0.8
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 27
+    },
+    {
+      "uid": "d4e0a84d-70bd-42b1-8b92-33bf54c20a19",
+      "name": "coffee maker",
+      "position": [
+        0.27,
+        0.82,
+        -3.3899999999999997
+      ],
+      "dimensions": {
+        "width": 2.03,
+        "height": 0.58,
+        "depth": 0.774
+      },
+      "rawDimensions": {
+        "width": 0.4,
+        "height": 0.4,
+        "depth": 0.4
+      },
+      "confidence": 0.95,
+      "isOpening": false,
+      "volumeAccuracy": 25
+    },
+    {
+      "uid": "6cf4dbd5-10b8-4e1c-95c9-589cd1209e04",
+      "name": "window valance",
+      "position": [
+        2.850584344693289,
+        1.7056803978778272,
+        -3.242009469149131
+      ],
+      "dimensions": {
+        "width": 5.164,
+        "height": 0.447,
+        "depth": 0.128
+      },
+      "rawDimensions": {
+        "width": 8.1,
+        "height": 0.7,
+        "depth": 0.2
+      },
+      "confidence": 1,
+      "isOpening": false
+    },
+    {
+      "uid": "bd422be7-5ca4-44d9-875b-62e48e71142e",
+      "name": "curtains",
+      "position": [
+        -1.53125,
+        1.11875,
+        -3.64375
+      ],
+      "dimensions": {
+        "width": 2.127,
+        "height": 0.193,
+        "depth": 1.74
+      },
+      "rawDimensions": {
+        "width": 2.2,
+        "height": 0.2,
+        "depth": 1.8
+      },
+      "confidence": 0.95,
+      "isOpening": false,
+      "volumeAccuracy": 15
+    },
+    {
+      "uid": "0cd84822-862f-4c48-a388-0f40467c89ae",
+      "name": "sink",
+      "position": [
+        0.29,
+        0.5049999999999999,
+        -1.3900000000000001
+      ],
+      "dimensions": {
+        "width": 2.127,
+        "height": 0.483,
+        "depth": 1.644
+      },
+      "rawDimensions": {
+        "width": 2.2,
+        "height": 0.5,
+        "depth": 1.7
+      },
+      "confidence": 0.95,
+      "isOpening": false,
+      "volumeAccuracy": 34
+    },
+    {
+      "uid": "49564fa8-f05c-4e36-9ee6-062e2a393d15",
+      "name": "base cabinet",
+      "position": [
+        1.45,
+        0.15,
+        -2.35
+      ],
+      "dimensions": {
+        "width": 1.837,
+        "height": 0.29,
+        "depth": 1.74
+      },
+      "rawDimensions": {
+        "width": 1.9,
+        "height": 0.3,
+        "depth": 1.8
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 18
+    },
+    {
+      "uid": "366dca11-453d-4224-9d1f-091c61015f12",
+      "name": "blinds",
+      "position": [
+        1.35,
+        1.075,
+        -2.7
+      ],
+      "dimensions": {
+        "width": 0.58,
+        "height": 0.29,
+        "depth": 1.064
+      },
+      "rawDimensions": {
+        "width": 0.6,
+        "height": 0.3,
+        "depth": 1.1
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 7
+    },
+    {
+      "uid": "07880a34-ff20-42a3-a73f-ff481aae1b05",
+      "name": "picture frame",
+      "position": [
+        -2.15,
+        0.8166666666666668,
+        -1.2166666666666666
+      ],
+      "dimensions": {
+        "width": 2.127,
+        "height": 1.064,
+        "depth": 2.127
+      },
+      "rawDimensions": {
+        "width": 0.3,
+        "height": 0.7,
+        "depth": 0.4
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 20
+    },
+    {
+      "uid": "35c82286-9476-4690-b351-57011e667ff5",
+      "name": "ceiling fan",
+      "position": [
+        -0.175,
+        2.375,
+        -2.975
+      ],
+      "dimensions": {
+        "width": 0.145,
+        "height": 0.048,
+        "depth": 0.048
+      },
+      "rawDimensions": {
+        "width": 0.15,
+        "height": 0.05,
+        "depth": 0.05
+      },
+      "confidence": 0.9,
+      "isOpening": false,
+      "volumeAccuracy": 99
+    },
+    {
+      "uid": "0b6e1b62-0f8d-48c1-beec-2e617ee37c93",
+      "name": "cabinet",
+      "position": [
+        0.8250000000000001,
+        0.5583333333333335,
+        -2.608333333333334
+      ],
+      "dimensions": {
+        "width": 2.127,
+        "height": 0.628,
+        "depth": 0.725
+      },
+      "rawDimensions": {
+        "width": 0.5,
+        "height": 0.3,
+        "depth": 1.4
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 5
+    },
+    {
+      "uid": "5f672105-e2a9-480b-9a79-ab7c29a2a666",
+      "name": "dresser",
+      "position": [
+        1,
+        0.175,
+        -1.5
+      ],
+      "dimensions": {
+        "width": 1.403,
+        "height": 0.128,
+        "depth": 1.403
+      },
+      "rawDimensions": {
+        "width": 2.2,
+        "height": 0.4,
+        "depth": 2.2
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 19
+    },
+    {
+      "uid": "60e6281a-6278-4938-868d-57165432ba6d",
+      "name": "wall decor",
+      "position": [
+        -2.125,
+        2.175,
+        -3.475
+      ],
+      "dimensions": {
+        "width": 0.097,
+        "height": 0.145,
+        "depth": 0.29
+      },
+      "rawDimensions": {
+        "width": 0.1,
+        "height": 0.15,
+        "depth": 0.3
+      },
+      "confidence": 0.9,
+      "isOpening": false,
+      "volumeAccuracy": 99
+    },
+    {
+      "uid": "f082cc0a-bbf7-4d6e-b08e-be430944561f",
+      "name": "picture",
+      "position": [
+        -0.25,
+        1.55,
+        2.65
+      ],
+      "dimensions": {
+        "width": 0.29,
+        "height": 0.29,
+        "depth": 0.483
+      },
+      "rawDimensions": {
+        "width": 0.3,
+        "height": 0.3,
+        "depth": 0.5
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 36
+    },
+    {
+      "uid": "a9f56fd3-65ba-4d78-bd1e-a3abc7c520b8",
+      "name": "doorway",
+      "position": [
+        -0.9302369036204434,
+        0.6277704111210533,
+        2.303969039807156
+      ],
+      "dimensions": {
+        "width": 10,
+        "height": 2.2,
+        "depth": 9.3
+      },
+      "rawDimensions": {
+        "width": 16,
+        "height": 0.2,
+        "depth": 0.2
+      },
+      "confidence": 0.9,
+      "isOpening": false
+    },
+    {
+      "uid": "b7a57d6d-1766-41db-9d60-c73103be85c9",
+      "name": "armchair",
+      "position": [
+        -1.1166666666666667,
+        0.65,
+        0.9499999999999998
+      ],
+      "dimensions": {
+        "width": 1.334,
+        "height": 0.476,
+        "depth": 0.667
+      },
+      "rawDimensions": {
+        "width": 0.3,
+        "height": 0.6,
+        "depth": 0.6
+      },
+      "confidence": 0.9,
+      "isOpening": false,
+      "volumeAccuracy": 10
+    },
+    {
+      "uid": "44e2a370-a656-4fa1-af9d-cbec28ba115f",
+      "name": "painting",
+      "position": [
+        -0.6625,
+        1.1749999999999998,
+        1.4625
+      ],
+      "dimensions": {
+        "width": 0.145,
+        "height": 0.097,
+        "depth": 0.097
+      },
+      "rawDimensions": {
+        "width": 2,
+        "height": 1,
+        "depth": 2.2
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 4
+    },
+    {
+      "uid": "e671b1d3-5b5f-434c-a343-324ce1ee8a16",
+      "name": "cabinets",
+      "position": [
+        0.7833333333333332,
+        0.7166666666666667,
+        2.4499999999999997
+      ],
+      "dimensions": {
+        "width": 1.064,
+        "height": 0.677,
+        "depth": 1.547
+      },
+      "rawDimensions": {
+        "width": 1.5,
+        "height": 1.7,
+        "depth": 1.8
+      },
+      "confidence": 0.9,
+      "isOpening": false,
+      "volumeAccuracy": 4
+    },
+    {
+      "uid": "1d931156-1778-457b-aceb-4dbb73522a0b",
+      "name": "dining table",
+      "position": [
+        0.25,
+        0.55,
+        2.45
+      ],
+      "dimensions": {
+        "width": 1.103,
+        "height": 0.702,
+        "depth": 1.604
+      },
+      "rawDimensions": {
+        "width": 1.1,
+        "height": 0.7,
+        "depth": 1.6
+      },
+      "confidence": 0.9,
+      "isOpening": false,
+      "volumeAccuracy": 7
+    },
+    {
+      "uid": "29264aa3-6905-4566-a7a3-d9f60ba2dd54",
+      "name": "vent",
+      "position": [
+        -0.225,
+        2.425,
+        3.675
+      ],
+      "dimensions": {
+        "width": 0.048,
+        "height": 0.135,
+        "depth": 0.048
+      },
+      "rawDimensions": {
+        "width": 0.05,
+        "height": 0.14,
+        "depth": 0.05
+      },
+      "confidence": 1,
+      "isOpening": false,
+      "volumeAccuracy": 99
+    },
+    {
+      "uid": "dee74884-176c-42fc-8040-4f7df5629d09",
+      "name": "door",
+      "position": [
+        -1.2124134066666414,
+        1.1054064520489844,
+        4.190629482269287
+      ],
+      "dimensions": {
+        "width": 15.47,
+        "height": 8.799,
+        "depth": 8.315
+      },
+      "rawDimensions": {
+        "width": 16,
+        "height": 9.1,
+        "depth": 8.6
+      },
+      "confidence": 1,
+      "isOpening": false
+    }
+  ]
+}
